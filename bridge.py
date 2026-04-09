@@ -313,11 +313,11 @@ async def _cleanup(app: web.Application) -> None:
     await app["session"].close()
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── App factory + main ─────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    """Start the bridge server."""
+def create_app() -> web.Application:
+    """Create and return the aiohttp application (used by service wrapper too)."""
     app = web.Application()
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
@@ -331,12 +331,14 @@ def main() -> None:
     app.router.add_post("/audio/{index}", _audio_track)
     app.router.add_post("/subtitle/{index}", _subtitle_track)
     app.router.add_post("/open", _open_file)
+    return app
 
+
+def main() -> None:
+    """Start the bridge server (standalone mode)."""
     print(f"MPC-HC Bridge  →  http://0.0.0.0:{BRIDGE_PORT}")
     print(f"MPC-HC target  →  http://localhost:{MPCHC_PORT}")
-    print("Endpoints: /status  /tracks  /commands  /command/{{cmd}}")
-    print("           /seek?pos_ms=  /volume?level=  /audio/{{n}}  /subtitle/{{n}}")
-    web.run_app(app, host="0.0.0.0", port=BRIDGE_PORT, print=lambda _: None)
+    web.run_app(create_app(), host="0.0.0.0", port=BRIDGE_PORT, print=lambda _: None)
 
 
 if __name__ == "__main__":
