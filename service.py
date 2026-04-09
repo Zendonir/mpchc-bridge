@@ -108,20 +108,20 @@ def _print_usage() -> None:
 
 
 def main() -> None:
-    """Dispatch install/start/stop/remove/debug commands."""
-    if not _PYWIN32_AVAILABLE:
-        print("ERROR: pywin32 is required for service management.")
-        print("       Install with: pip install pywin32")
-        sys.exit(1)
-
+    """Dispatch based on arguments, or launch GUI if none given."""
     args = sys.argv[1:]
 
-    if not args or args[0] in ("-h", "--help"):
+    # No arguments → open GUI
+    if not args:
+        from gui import main as gui_main
+        gui_main()
+        return
+
+    if args[0] in ("-h", "--help"):
         _print_usage()
         return
 
     if args[0] == "debug":
-        # Run in foreground without SCM
         from bridge import BRIDGE_PORT, main as bridge_main
         print(f"Running in debug mode on port {BRIDGE_PORT} — Ctrl+C to stop")
         bridge_main()
@@ -131,15 +131,18 @@ def main() -> None:
         import subprocess
         result = subprocess.run(
             ["sc", "query", "MpcHcBridge"],
-            capture_output=True, text=True
+            capture_output=True, text=True,
         )
         print(result.stdout or result.stderr)
         return
 
-    # Delegate install/start/stop/restart/remove to pywin32
-    # pywin32 reads sys.argv directly
+    if not _PYWIN32_AVAILABLE:
+        print("ERROR: pywin32 is required for service management.")
+        print("       Install with: pip install pywin32")
+        sys.exit(1)
+
+    # SCM dispatcher (called by Windows when starting the service)
     if len(sys.argv) == 1:
-        # Called by SCM without arguments — start dispatcher
         servicemanager.Initialize()
         servicemanager.PrepareToHostSingle(MpcHcBridgeService)
         servicemanager.StartServiceCtrlDispatcher()

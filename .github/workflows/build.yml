@@ -38,9 +38,10 @@ jobs:
           pyinstaller `
             --onefile `
             --name mpchc-bridge `
-            --icon NONE `
+            --noconsole `
             --hidden-import win32timezone `
             --hidden-import pywintypes `
+            --hidden-import tkinter `
             service.py
 
       - name: Get version
