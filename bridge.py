@@ -16,12 +16,16 @@ Endpoints:
 """
 
 import asyncio
+import logging
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, web
+
+_LOG = logging.getLogger(__name__)
 
 # ── win32 via ctypes (no external dependency) ──────────────────────────────────
 if sys.platform == "win32":
@@ -119,7 +123,7 @@ async def _mpchc_get(
     session: ClientSession, path: str, params: dict | None = None
 ) -> str | None:
     try:
-        url = f"http://localhost:{MPCHC_PORT}{path}"
+        url = f"http://127.0.0.1:{MPCHC_PORT}{path}"
         async with session.get(url, params=params, allow_redirects=False) as r:
             if r.status in (200, 302):
                 return await r.text()
@@ -130,11 +134,15 @@ async def _mpchc_get(
 
 async def _mpchc_command(session: ClientSession, params: dict) -> bool:
     """Fire a command at MPC-HC and return immediately — don't read body."""
+    t0 = time.monotonic()
     try:
-        url = f"http://localhost:{MPCHC_PORT}/command.html"
+        url = f"http://127.0.0.1:{MPCHC_PORT}/command.html"
         async with session.get(url, params=params, allow_redirects=False, timeout=_CMD_TIMEOUT) as r:
-            return r.status in (200, 302)
-    except Exception:  # pylint: disable=broad-exception-caught
+            ok = r.status in (200, 302)
+            _LOG.warning("_mpchc_command %s → %s in %.3fs", params, r.status, time.monotonic() - t0)
+            return ok
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        _LOG.warning("_mpchc_command %s failed in %.3fs: %s", params, time.monotonic() - t0, ex)
         return False
 
 
@@ -235,15 +243,19 @@ async def _tracks(req: web.Request) -> web.Response:
 
 async def _command(req: web.Request) -> web.Response:
     """Send a named command."""
+    t0 = time.monotonic()
     cmd = req.match_info["cmd"]
     if cmd not in CMD:
         valid = sorted(CMD.keys())
         return web.json_response({"error": f"Unknown command '{cmd}'", "valid": valid}, status=400)
     cmd_id = CMD[cmd]
-    if not _post_wm_command(cmd_id):
+    wm_ok = _post_wm_command(cmd_id)
+    _LOG.warning("_command '%s': PostMessageW=%s in %.3fs", cmd, wm_ok, time.monotonic() - t0)
+    if not wm_ok:
         # Service runs in Session 0 — fall back to MPC-HC HTTP (works across sessions)
         if not await _mpchc_command(req.app["session"], {"wm_command": cmd_id}):
             return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    _LOG.warning("_command '%s' total: %.3fs", cmd, time.monotonic() - t0)
     return web.json_response({"ok": True, "command": cmd, "wm_command": cmd_id})
 
 
@@ -425,8 +437,9 @@ def create_app() -> web.Application:
 
 def main() -> None:
     """Start the bridge server (standalone mode)."""
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     print(f"MPC-HC Bridge  →  http://0.0.0.0:{BRIDGE_PORT}")
-    print(f"MPC-HC target  →  http://localhost:{MPCHC_PORT}")
+    print(f"MPC-HC target  →  http://127.0.0.1:{MPCHC_PORT}")
     web.run_app(create_app(), host="0.0.0.0", port=BRIDGE_PORT, print=lambda _: None)
 
 
