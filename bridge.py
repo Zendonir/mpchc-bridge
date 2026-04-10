@@ -281,8 +281,9 @@ async def _seek(req: web.Request) -> web.Response:
         pos_ms = int(req.rel_url.query["pos_ms"])
     except (KeyError, ValueError):
         return web.json_response({"error": "pos_ms required (milliseconds)"}, status=400)
-    # MPC-HC /command.html accepts position in seconds
-    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": f"{pos_ms / 1000:.3f}"}):
+    pos_sec = pos_ms / 1000
+    _LOG.warning("_seek: pos_ms=%d  pos_sec=%.3f", pos_ms, pos_sec)
+    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": f"{pos_sec:.3f}"}):
         return web.json_response({"error": "Seek failed — MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "position_ms": pos_ms})
 
