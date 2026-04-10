@@ -6,6 +6,7 @@ Exposes a full HTTP API so the UC Remote driver can control everything.
 Endpoints:
   GET  /status                   — playback state, position, volume, file
   GET  /tracks                   — available audio + subtitle tracks
+  GET  /ws                       — WebSocket: pushed state changes (JSON diffs)
   POST /command/{cmd}            — named playback command (see CMD dict)
   POST /seek?pos_ms=<int>        — absolute seek in milliseconds
   POST /volume?level=<0-100>     — set exact volume
@@ -14,6 +15,7 @@ Endpoints:
   POST /open?path=<filepath>     — open file in MPC-HC
 """
 
+import asyncio
 import re
 import subprocess
 import sys
@@ -307,14 +309,82 @@ async def _commands_list(req: web.Request) -> web.Response:  # noqa: ARG001
     return web.json_response({"commands": sorted(CMD.keys())})
 
 
+# ── WebSocket push ─────────────────────────────────────────────────────────────
+
+_ws_clients: set[web.WebSocketResponse] = set()
+_PUSH_INTERVAL_PLAYING = 1.0   # seconds — while MPC-HC is playing
+_PUSH_INTERVAL_IDLE = 3.0       # seconds — paused / stopped / unreachable
+
+
+async def _broadcast(data: dict) -> None:
+    """Send a JSON diff to all connected WebSocket clients."""
+    for ws in list(_ws_clients):
+        try:
+            await ws.send_json(data)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _ws_clients.discard(ws)
+
+
+async def _ws_handler(req: web.Request) -> web.WebSocketResponse:
+    """WebSocket endpoint — push-only stream of MPC-HC state changes."""
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(req)
+    _ws_clients.add(ws)
+    try:
+        async for _ in ws:
+            pass  # client-to-server messages are ignored
+    finally:
+        _ws_clients.discard(ws)
+    return ws
+
+
+async def _push_task(app: web.Application) -> None:
+    """Poll MPC-HC locally and broadcast changed fields to WebSocket clients."""
+    prev: dict = {}
+    while True:
+        interval = _PUSH_INTERVAL_IDLE
+        try:
+            html = await _mpchc_get(app["session"], "/variables.html")
+            if html is not None:
+                v = _parse_variables(html)
+                state_id = int(v.get("state", 0))
+                current = {
+                    "state_id": state_id,
+                    "state": {0: "stopped", 1: "paused", 2: "playing"}.get(state_id, "unknown"),
+                    "position_ms": int(v.get("position", 0)),
+                    "duration_ms": int(v.get("duration", 0)),
+                    "volume": int(v.get("volumelevel", 0)),
+                    "muted": v.get("muted", "0") == "1",
+                    "audio_track": v.get("audiotrack", ""),
+                    "subtitle_track": v.get("subtitletrack", ""),
+                }
+                changed = {k: val for k, val in current.items() if prev.get(k) != val}
+                if changed:
+                    if _ws_clients:
+                        await _broadcast(changed)
+                    prev.update(changed)
+                interval = _PUSH_INTERVAL_PLAYING if state_id == 2 else _PUSH_INTERVAL_IDLE
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        await asyncio.sleep(interval)
+
+
 # ── App lifecycle ──────────────────────────────────────────────────────────────
 
 
 async def _startup(app: web.Application) -> None:
     app["session"] = ClientSession(timeout=_TIMEOUT)
+    app["push_task"] = asyncio.create_task(_push_task(app))
 
 
 async def _cleanup(app: web.Application) -> None:
+    task = app.get("push_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await app["session"].close()
 
 
@@ -330,6 +400,7 @@ def create_app() -> web.Application:
     app.router.add_get("/status", _status)
     app.router.add_get("/tracks", _tracks)
     app.router.add_get("/commands", _commands_list)
+    app.router.add_get("/ws", _ws_handler)
     app.router.add_post("/command/{cmd}", _command)
     app.router.add_post("/seek", _seek)
     app.router.add_post("/volume", _set_volume)
