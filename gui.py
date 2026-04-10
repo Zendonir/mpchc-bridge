@@ -397,6 +397,7 @@ class TestWindow(tk.Toplevel):
         self.configure(bg=CLR_BG)
         self._build_ui()
         self._refresh_status()
+        self._refresh_tracks()
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -580,29 +581,23 @@ class TestWindow(tk.Toplevel):
         tf = self._section(self, "Tracks")
         tf.pack(fill="x", **pad)
 
-        # Audio row
-        self._lbl(tf, "Audio", fg=CLR_ACCENT).pack(anchor="w")
-        self._audio_cur = tk.Label(tf, text="—", bg=CLR_BG, fg=CLR_TEXT,
-                                   font=("Consolas", 8), wraplength=460, justify="left")
-        self._audio_cur.pack(anchor="w", padx=(8, 0))
-        a_ctrl = tk.Frame(tf, bg=CLR_BG)
-        a_ctrl.pack(anchor="w", pady=(2, 6))
-        self._btn(a_ctrl, "◀ Prev", lambda: self._cmd("audio_prev"), width=7).pack(side="left", padx=(0, 2))
-        self._btn(a_ctrl, "Next ▶", lambda: self._cmd("audio_next"), width=7).pack(side="left", padx=(0, 2))
-        self._btn(a_ctrl, "Delay −", lambda: self._cmd("audio_delay_minus"), width=7).pack(side="left", padx=(0, 2))
-        self._btn(a_ctrl, "Delay +", lambda: self._cmd("audio_delay_plus"), width=7).pack(side="left")
+        tr_hdr = tk.Frame(tf, bg=CLR_BG)
+        tr_hdr.pack(fill="x")
+        self._lbl(tr_hdr, "Audio", fg=CLR_ACCENT).pack(side="left")
+        tk.Button(tr_hdr, text="↺ Refresh", command=lambda: self._run(self._refresh_tracks),
+                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                  relief="flat", padx=4, pady=1, font=("Segoe UI", 9), cursor="hand2").pack(side="right")
 
-        # Subtitle row
+        self._audio_frame = tk.Frame(tf, bg=CLR_BG)
+        self._audio_frame.pack(fill="x", pady=(2, 4))
+        tk.Label(self._audio_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+
         self._lbl(tf, "Subtitles", fg=CLR_ACCENT).pack(anchor="w")
-        self._sub_cur = tk.Label(tf, text="—", bg=CLR_BG, fg=CLR_TEXT,
-                                 font=("Consolas", 8), wraplength=460, justify="left")
-        self._sub_cur.pack(anchor="w", padx=(8, 0))
-        s_ctrl = tk.Frame(tf, bg=CLR_BG)
-        s_ctrl.pack(anchor="w", pady=(2, 0))
-        self._btn(s_ctrl, "◀ Prev", lambda: self._cmd("sub_prev"), width=7).pack(side="left", padx=(0, 2))
-        self._btn(s_ctrl, "Next ▶", lambda: self._cmd("sub_next"), width=7).pack(side="left", padx=(0, 2))
-        self._btn(s_ctrl, "Delay −", lambda: self._cmd("sub_delay_minus"), width=7).pack(side="left", padx=(0, 2))
-        self._btn(s_ctrl, "Delay +", lambda: self._cmd("sub_delay_plus"), width=7).pack(side="left")
+        self._sub_frame = tk.Frame(tf, bg=CLR_BG)
+        self._sub_frame.pack(fill="x", pady=(2, 0))
+        tk.Label(self._sub_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w")
 
         # ── Debug log ─────────────────────────────────────────────────────────
         lf = self._section(self, "Debug Log")
@@ -660,20 +655,66 @@ class TestWindow(tk.Toplevel):
                 f"Rate:      {data.get('playback_rate', 1.0)}x",
                 f"File:      {data.get('file') or '—'}",
             ]
-            audio = data.get("audio_track") or "—"
-            sub = data.get("subtitle_track") or "—"
             self.after(0, lambda: self._set_status_text("\n".join(lines)))
-            self.after(0, lambda a=audio, s=sub: (
-                self._audio_cur.config(text=a),
-                self._sub_cur.config(text=s),
-            ))
         self._run(_do)
+
+    def _refresh_tracks(self) -> None:
+        def _do():
+            data = _bridge_get("/tracks")
+            if "error" in data:
+                self.after(0, lambda: self._write_log([f"Tracks: {data['error']}"]))
+                return
+            self.after(0, lambda: self._build_track_buttons(data))
+        self._run(_do)
+
+    def _build_track_buttons(self, data: dict) -> None:
+        for frame, kind, cmd_prev, cmd_next in [
+            (self._audio_frame, "audio", "audio_prev", "audio_next"),
+            (self._sub_frame,   "subtitle", "sub_prev", "sub_next"),
+        ]:
+            for w in frame.winfo_children():
+                w.destroy()
+            tracks = data.get(kind, [])
+            if not tracks:
+                tk.Label(frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
+                         font=("Segoe UI", 9)).pack(anchor="w")
+                continue
+            for t in tracks:
+                pos = t["pos"]
+                active = t.get("selected", False)
+                lang = t.get("lang", "").upper() or "?"
+                name = t.get("name", "") or ""
+                codec = t.get("codec", "")
+                label = f"{'▶  ' if active else '    '}{lang}  {codec}" + (f"  [{name}]" if name else "")
+                bg = CLR_ACCENT if active else CLR_BTN
+                fg = CLR_BG if active else CLR_TEXT
+                tk.Button(frame, text=label, bg=bg, fg=fg,
+                          activebackground=CLR_BTN_HOVER, activeforeground=CLR_TEXT,
+                          relief="flat", padx=6, pady=3, anchor="w", width=50,
+                          font=("Consolas", 8), cursor="hand2",
+                          command=lambda k=kind, p=pos: self._run(
+                              lambda: self._select_track_and_refresh(k, p)
+                          )).pack(fill="x", pady=1)
+            # cycling controls below the list
+            ctrl = tk.Frame(frame, bg=CLR_BG)
+            ctrl.pack(anchor="w", pady=(3, 0))
+            self._btn(ctrl, "◀ Prev", lambda c=cmd_prev: self._cmd(c), width=6).pack(side="left", padx=(0, 2))
+            self._btn(ctrl, "Next ▶", lambda c=cmd_next: self._cmd(c), width=6).pack(side="left")
+
+    def _select_track_and_refresh(self, kind: str, pos: int) -> None:
+        result = _bridge_post(f"/{kind}/select/{pos}")
+        self._show(result)
+        import time as _time
+        _time.sleep(0.4)
+        data = _bridge_get("/tracks")
+        if "error" not in data:
+            self.after(0, lambda: self._build_track_buttons(data))
 
     def _show_and_refresh(self, result: dict) -> None:
         self._show(result)
         import time as _time
         _time.sleep(0.3)
-        self._refresh_status()
+        self._refresh_tracks()
 
     # ── Action handlers ────────────────────────────────────────────────────────
 

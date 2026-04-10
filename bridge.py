@@ -171,7 +171,7 @@ def _parse_variables(html: str) -> dict[str, str]:
 
 
 def _parse_tracks(html: str) -> dict[str, list]:
-    """Parse audio/subtitle track lists from /controls.html select elements."""
+    """Parse audio/subtitle track lists from /controls.html select elements (original MPC-HC only)."""
     result: dict[str, list] = {"audio": [], "subtitle": []}
     for sel_id, key in (("audiotrackid", "audio"), ("subtrackid", "subtitle")):
         m = re.search(
@@ -189,6 +189,170 @@ def _parse_tracks(html: str) -> dict[str, list]:
                     }
                 )
     return result
+
+
+# ── MKV EBML track parser (pure Python, no external deps) ─────────────────────
+
+def _ebml_id(buf: bytes, pos: int) -> tuple[int, int]:
+    b = buf[pos]
+    if b >= 0x80: return b, pos + 1
+    if b >= 0x40: return (b << 8) | buf[pos + 1], pos + 2
+    if b >= 0x20: return (b << 16) | (buf[pos + 1] << 8) | buf[pos + 2], pos + 3
+    if b >= 0x10: return (b << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3], pos + 4
+    raise ValueError(f"bad EBML ID {b:#x} at {pos}")
+
+
+def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
+    b = buf[pos]
+    if b >= 0x80: return b & 0x7F, pos + 1
+    if b >= 0x40: return ((b & 0x3F) << 8) | buf[pos + 1], pos + 2
+    if b >= 0x20: return ((b & 0x1F) << 16) | (buf[pos + 1] << 8) | buf[pos + 2], pos + 3
+    if b >= 0x10: return ((b & 0x0F) << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3], pos + 4
+    if b >= 0x08:
+        v = (b & 0x07)
+        for i in range(4): v = (v << 8) | buf[pos + 1 + i]
+        return v, pos + 5
+    if b == 0x01:
+        v = 0
+        for i in range(7): v = (v << 8) | buf[pos + 1 + i]
+        return v, pos + 8
+    return -1, pos + 1  # unknown / all-ones = infinite
+
+
+def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
+    """
+    Parse an MKV file's EBML track list. Returns:
+      {"audio": [{"pos": N, "name": "...", "lang": "ger", "codec": "A_AC3"}, …],
+       "subtitle": […]}
+    pos = 0-based position in the track-type list (for cycling calculation).
+    Returns None if file cannot be read or is not MKV.
+    """
+    _ID_EBML     = 0x1A45DFA3
+    _ID_SEGMENT  = 0x18538067
+    _ID_TRACKS   = 0x1654AE6B
+    _ID_CLUSTER  = 0x1F43B675
+    _ID_ENTRY    = 0xAE
+    _ID_NUM      = 0xD7
+    _ID_TYPE     = 0x83
+    _ID_NAME     = 0x536E
+    _ID_LANG     = 0x22B59C
+    _ID_CODEC    = 0x86
+    _TYPE_AUDIO  = 2
+    _TYPE_SUB    = 17
+
+    try:
+        with open(filepath, "rb") as fh:
+            buf = fh.read(524288)  # 512 KB — always enough for track headers
+        n = len(buf)
+        if n < 8 or buf[:4] != b"\x1a\x45\xdf\xa3":
+            return None  # not MKV
+
+        pos = 0
+        # Skip EBML header element
+        _, pos = _ebml_id(buf, pos)
+        esz, pos = _ebml_size(buf, pos)
+        pos += esz
+
+        # Expect Segment element
+        eid, pos = _ebml_id(buf, pos)
+        if eid != _ID_SEGMENT:
+            return None
+        esz, pos = _ebml_size(buf, pos)
+        seg_end = (pos + esz) if esz >= 0 else n
+
+        result: dict[str, list] = {"audio": [], "subtitle": []}
+
+        # Scan Segment children for Tracks (always before first Cluster)
+        while pos < min(seg_end, n) - 4:
+            try:
+                eid, npos = _ebml_id(buf, pos)
+                esz, npos = _ebml_size(buf, npos)
+            except (IndexError, ValueError):
+                break
+            if esz < 0 or esz > n:
+                esz = n - npos
+            el_end = npos + esz
+
+            if eid == _ID_CLUSTER:
+                break  # tracks always precede first cluster
+            if eid == _ID_TRACKS:
+                tpos = npos
+                while tpos < min(el_end, n) - 2:
+                    try:
+                        tid, tpos2 = _ebml_id(buf, tpos)
+                        tsz, tpos2 = _ebml_size(buf, tpos2)
+                    except (IndexError, ValueError):
+                        break
+                    if tsz < 0: tsz = 0
+                    te_end = tpos2 + tsz
+                    if tid == _ID_ENTRY:
+                        track: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": ""}
+                        epos = tpos2
+                        while epos < min(te_end, n) - 2:
+                            try:
+                                fid, epos2 = _ebml_id(buf, epos)
+                                fsz, epos2 = _ebml_size(buf, epos2)
+                            except (IndexError, ValueError):
+                                break
+                            if fsz < 0: fsz = 0
+                            fdata = buf[epos2: epos2 + fsz]
+                            if fid == _ID_NUM:   track["number"] = int.from_bytes(fdata, "big")
+                            elif fid == _ID_TYPE: track["type"]   = int.from_bytes(fdata, "big")
+                            elif fid == _ID_NAME: track["name"]   = fdata.decode("utf-8", errors="replace")
+                            elif fid == _ID_LANG: track["lang"]   = fdata.decode("ascii", errors="replace").rstrip("\x00")
+                            elif fid == _ID_CODEC: track["codec"] = fdata.decode("ascii", errors="replace").rstrip("\x00")
+                            epos = epos2 + fsz
+                        if track["type"] == _TYPE_AUDIO:
+                            track["pos"] = len(result["audio"])
+                            result["audio"].append(track)
+                        elif track["type"] == _TYPE_SUB:
+                            track["pos"] = len(result["subtitle"])
+                            result["subtitle"].append(track)
+                    tpos = te_end
+                return result
+            pos = npos + esz
+
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        _LOG.warning("_read_mkv_tracks %s: %s", filepath, ex)
+    return None
+
+
+def _match_track(mkv_tracks: list[dict], current_name: str) -> int:
+    """
+    Match MPC-HC's current track string (e.g. 'A: German AC3…[ger]') against
+    MKV track list. Returns 0-based pos, or -1 if not found.
+    """
+    if not current_name or not mkv_tracks:
+        return 0  # assume first track
+    cur = current_name.lower()
+    # Extract 3-letter language code from brackets e.g. "[ger]"
+    lang_m = re.search(r'\[([a-z]{3})\]', cur)
+    cur_lang = lang_m.group(1) if lang_m else ""
+    # Extract codec hint: ac3, dts, aac, flac, truehd, eac3, pcm, mp3, vorbis, opus, vobsub, ass, srt, subrip, pgs
+    codec_hints = {
+        "ac3": "A_AC3", "dts": "A_DTS", "aac": "A_AAC", "flac": "A_FLAC",
+        "truehd": "A_TRUEHD", "eac3": "A_EAC3", "mp3": "A_MPEG", "opus": "A_OPUS",
+        "vorbis": "A_VORBIS", "vobsub": "S_VOBSUB", "ass": "S_TEXT/ASS",
+        "subrip": "S_TEXT/UTF8", "pgs": "S_HDMV/PGS",
+    }
+    cur_codec = ""
+    for hint, codec in codec_hints.items():
+        if hint in cur:
+            cur_codec = codec
+            break
+
+    best_pos, best_score = 0, -1
+    for t in mkv_tracks:
+        score = 0
+        if cur_lang and t.get("lang", "").lower() == cur_lang:
+            score += 10
+        if cur_codec and t.get("codec", "").upper().startswith(cur_codec.upper().split("/")[0]):
+            score += 5
+        if t.get("name") and t["name"].lower() in cur:
+            score += 3
+        if score > best_score:
+            best_score, best_pos = score, t["pos"]
+    return best_pos
 
 
 def _find_mpchc_exe() -> str | None:
@@ -250,11 +414,94 @@ async def _status(req: web.Request) -> web.Response:
 
 
 async def _tracks(req: web.Request) -> web.Response:
-    """List available audio and subtitle tracks with current selection."""
-    html = await _mpchc_get(req.app["session"], "/controls.html")
+    """List available audio and subtitle tracks, parsed from the open MKV file."""
+    html = await _mpchc_get(req.app["session"], "/variables.html")
     if html is None:
         return web.json_response({"error": "MPC-HC not reachable"}, status=503)
-    return web.json_response(_parse_tracks(html))
+    v = _parse_variables(html)
+    filepath = v.get("filepath", "")
+    cur_audio = v.get("audiotrack", "")
+    cur_sub = v.get("subtitletrack", "")
+
+    if not filepath:
+        return web.json_response({"error": "No file loaded in MPC-HC"}, status=404)
+
+    mkv = _read_mkv_tracks(filepath)
+    if mkv is None:
+        return web.json_response({"error": f"Cannot read track info from: {filepath}"}, status=422)
+
+    cur_audio_pos = _match_track(mkv["audio"], cur_audio)
+    cur_sub_pos = _match_track(mkv["subtitle"], cur_sub)
+
+    for t in mkv["audio"]:
+        t["selected"] = t["pos"] == cur_audio_pos
+        t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+    for t in mkv["subtitle"]:
+        t["selected"] = t["pos"] == cur_sub_pos
+        t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+
+    return web.json_response({
+        "audio": mkv["audio"],
+        "subtitle": mkv["subtitle"],
+        "current_audio_pos": cur_audio_pos,
+        "current_sub_pos": cur_sub_pos,
+        "filepath": filepath,
+    })
+
+
+async def _select_track(req: web.Request) -> web.Response:
+    """Cycle to a specific track by position. POST /audio/select/{pos} or /subtitle/select/{pos}"""
+    kind = req.match_info["kind"]   # "audio" or "subtitle"
+    try:
+        target_pos = int(req.match_info["pos"])
+    except ValueError:
+        return web.json_response({"error": "Invalid pos"}, status=400)
+
+    # Get current state
+    html = await _mpchc_get(req.app["session"], "/variables.html")
+    if html is None:
+        return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    v = _parse_variables(html)
+    filepath = v.get("filepath", "")
+    if not filepath:
+        return web.json_response({"error": "No file loaded"}, status=404)
+
+    mkv = _read_mkv_tracks(filepath)
+    if mkv is None:
+        return web.json_response({"error": "Cannot read track info"}, status=422)
+
+    tracks = mkv[kind]
+    if not tracks:
+        return web.json_response({"error": f"No {kind} tracks found"}, status=404)
+    if target_pos < 0 or target_pos >= len(tracks):
+        return web.json_response({"error": f"pos out of range 0..{len(tracks)-1}"}, status=400)
+
+    cur_name = v.get("audiotrack" if kind == "audio" else "subtitletrack", "")
+    cur_pos = _match_track(tracks, cur_name)
+
+    n = len(tracks)
+    steps_fwd = (target_pos - cur_pos) % n
+    steps_bwd = (cur_pos - target_pos) % n
+
+    if steps_fwd == 0:
+        return web.json_response({"ok": True, "steps": 0, "direction": "none"})
+
+    cmd_next = "audio_next" if kind == "audio" else "sub_next"
+    cmd_prev = "audio_prev" if kind == "audio" else "sub_prev"
+
+    if steps_fwd <= steps_bwd:
+        cmd, steps = cmd_next, steps_fwd
+    else:
+        cmd, steps = cmd_prev, steps_bwd
+
+    cmd_id = CMD[cmd]
+    for _ in range(steps):
+        if not _post_wm_command(cmd_id):
+            await _mpchc_command(req.app["session"], {"wm_command": cmd_id})
+        await asyncio.sleep(0.05)  # small gap between steps
+
+    _LOG.warning("_select_track %s: cur=%d target=%d cmd=%s steps=%d", kind, cur_pos, target_pos, cmd, steps)
+    return web.json_response({"ok": True, "steps": steps, "direction": cmd})
 
 
 async def _command(req: web.Request) -> web.Response:
@@ -462,6 +709,7 @@ def create_app() -> web.Application:
     app.router.add_get("/", _index)
     app.router.add_get("/status", _status)
     app.router.add_get("/tracks", _tracks)
+    app.router.add_post("/{kind:(audio|subtitle)}/select/{pos}", _select_track)
     app.router.add_get("/commands", _commands_list)
     app.router.add_get("/debug/log", _debug_log)
     app.router.add_get("/debug/controls", _debug_controls)
