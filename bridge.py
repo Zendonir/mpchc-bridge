@@ -97,14 +97,14 @@ CMD: dict[str, int] = {
     "zoom_100": 834,
     "zoom_200": 835,
     "zoom_fit": 836,
-    # Subtitles
-    "sub_toggle": 955,
+    # Subtitles  (954 = Subtitle >, 955 = < Subtitle)
     "sub_next": 954,
-    "sub_prev": 953,
+    "sub_prev": 955,
     "sub_delay_plus": 958,
     "sub_delay_minus": 957,
     # Audio
     "audio_next": 952,
+    "audio_prev": 953,
     "audio_delay_plus": 946,
     "audio_delay_minus": 945,
     # Chapters

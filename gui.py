@@ -397,7 +397,6 @@ class TestWindow(tk.Toplevel):
         self.configure(bg=CLR_BG)
         self._build_ui()
         self._refresh_status()
-        self._refresh_tracks()
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -536,7 +535,7 @@ class TestWindow(tk.Toplevel):
         sub_row = tk.Frame(subf, bg=CLR_BG)
         sub_row.pack()
         for text, name in [
-            ("◀ Prev", "sub_prev"), ("Toggle", "sub_toggle"), ("Next ▶", "sub_next"),
+            ("◀ Prev", "sub_prev"), ("Next ▶", "sub_next"),
             ("Delay −", "sub_delay_minus"), ("Delay +", "sub_delay_plus"),
         ]:
             self._btn(sub_row, text, lambda n=name: self._cmd(n), width=7).pack(side="left", padx=2)
@@ -581,24 +580,29 @@ class TestWindow(tk.Toplevel):
         tf = self._section(self, "Tracks")
         tf.pack(fill="x", **pad)
 
-        tr_hdr = tk.Frame(tf, bg=CLR_BG)
-        tr_hdr.pack(fill="x")
-        self._lbl(tr_hdr, "Audio", fg=CLR_ACCENT).pack(side="left", padx=(0, 8))
-        tk.Button(tr_hdr, text="↺", command=self._refresh_tracks,
-                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
-                  relief="flat", padx=4, pady=1,
-                  font=("Segoe UI", 9), cursor="hand2").pack(side="right")
+        # Audio row
+        self._lbl(tf, "Audio", fg=CLR_ACCENT).pack(anchor="w")
+        self._audio_cur = tk.Label(tf, text="—", bg=CLR_BG, fg=CLR_TEXT,
+                                   font=("Consolas", 8), wraplength=460, justify="left")
+        self._audio_cur.pack(anchor="w", padx=(8, 0))
+        a_ctrl = tk.Frame(tf, bg=CLR_BG)
+        a_ctrl.pack(anchor="w", pady=(2, 6))
+        self._btn(a_ctrl, "◀ Prev", lambda: self._cmd("audio_prev"), width=7).pack(side="left", padx=(0, 2))
+        self._btn(a_ctrl, "Next ▶", lambda: self._cmd("audio_next"), width=7).pack(side="left", padx=(0, 2))
+        self._btn(a_ctrl, "Delay −", lambda: self._cmd("audio_delay_minus"), width=7).pack(side="left", padx=(0, 2))
+        self._btn(a_ctrl, "Delay +", lambda: self._cmd("audio_delay_plus"), width=7).pack(side="left")
 
-        self._audio_frame = tk.Frame(tf, bg=CLR_BG)
-        self._audio_frame.pack(fill="x", pady=(2, 4))
-        tk.Label(self._audio_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w")
-
+        # Subtitle row
         self._lbl(tf, "Subtitles", fg=CLR_ACCENT).pack(anchor="w")
-        self._sub_frame = tk.Frame(tf, bg=CLR_BG)
-        self._sub_frame.pack(fill="x", pady=(2, 0))
-        tk.Label(self._sub_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w")
+        self._sub_cur = tk.Label(tf, text="—", bg=CLR_BG, fg=CLR_TEXT,
+                                 font=("Consolas", 8), wraplength=460, justify="left")
+        self._sub_cur.pack(anchor="w", padx=(8, 0))
+        s_ctrl = tk.Frame(tf, bg=CLR_BG)
+        s_ctrl.pack(anchor="w", pady=(2, 0))
+        self._btn(s_ctrl, "◀ Prev", lambda: self._cmd("sub_prev"), width=7).pack(side="left", padx=(0, 2))
+        self._btn(s_ctrl, "Next ▶", lambda: self._cmd("sub_next"), width=7).pack(side="left", padx=(0, 2))
+        self._btn(s_ctrl, "Delay −", lambda: self._cmd("sub_delay_minus"), width=7).pack(side="left", padx=(0, 2))
+        self._btn(s_ctrl, "Delay +", lambda: self._cmd("sub_delay_plus"), width=7).pack(side="left")
 
         # ── Debug log ─────────────────────────────────────────────────────────
         lf = self._section(self, "Debug Log")
@@ -654,79 +658,22 @@ class TestWindow(tk.Toplevel):
                 f"Volume:    {data.get('volume', '?')}%   "
                 f"Muted:     {'Yes' if data.get('muted') else 'No'}   "
                 f"Rate:      {data.get('playback_rate', 1.0)}x",
-                f"Audio:     {data.get('audio_track') or '—'}",
-                f"Subtitle:  {data.get('subtitle_track') or '—'}",
                 f"File:      {data.get('file') or '—'}",
             ]
+            audio = data.get("audio_track") or "—"
+            sub = data.get("subtitle_track") or "—"
             self.after(0, lambda: self._set_status_text("\n".join(lines)))
+            self.after(0, lambda a=audio, s=sub: (
+                self._audio_cur.config(text=a),
+                self._sub_cur.config(text=s),
+            ))
         self._run(_do)
-
-    def _refresh_tracks(self) -> None:
-        def _do():
-            data = _bridge_get("/tracks")
-            if "error" in data:
-                return
-            self.after(0, lambda: self._build_track_buttons(data))
-        self._run(_do)
-
-    def _build_track_buttons(self, data: dict) -> None:
-        # Audio tracks
-        for w in self._audio_frame.winfo_children():
-            w.destroy()
-        audio = data.get("audio", [])
-        if not audio:
-            tk.Label(self._audio_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
-                     font=("Segoe UI", 9)).pack(anchor="w")
-        for t in audio:
-            idx = t["index"]
-            name = t["name"]
-            active = t.get("selected", False)
-            bg = CLR_ACCENT if active else CLR_BTN
-            fg = CLR_BG if active else CLR_TEXT
-            lbl = f"{'▶ ' if active else '   '}{name}"
-            tk.Button(self._audio_frame, text=lbl, bg=bg, fg=fg,
-                      activebackground=CLR_BTN_HOVER, activeforeground=CLR_TEXT,
-                      relief="flat", padx=6, pady=2, anchor="w",
-                      font=("Segoe UI", 9), cursor="hand2",
-                      command=lambda i=idx: self._run(
-                          lambda: self._show_and_refresh(_bridge_post(f"/audio/{i}"))
-                      )).pack(fill="x", pady=1)
-
-        # Subtitle tracks
-        for w in self._sub_frame.winfo_children():
-            w.destroy()
-        subs = data.get("subtitle", [])
-        # "Off" button
-        tk.Button(self._sub_frame, text="   Off (disable)", bg=CLR_BTN, fg=CLR_TEXT,
-                  activebackground=CLR_BTN_HOVER, activeforeground=CLR_TEXT,
-                  relief="flat", padx=6, pady=2, anchor="w",
-                  font=("Segoe UI", 9), cursor="hand2",
-                  command=lambda: self._run(
-                      lambda: self._show_and_refresh(_bridge_post("/subtitle/-1"))
-                  )).pack(fill="x", pady=1)
-        if not subs:
-            tk.Label(self._sub_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
-                     font=("Segoe UI", 9)).pack(anchor="w")
-        for t in subs:
-            idx = t["index"]
-            name = t["name"]
-            active = t.get("selected", False)
-            bg = CLR_ACCENT if active else CLR_BTN
-            fg = CLR_BG if active else CLR_TEXT
-            lbl = f"{'▶ ' if active else '   '}{name}"
-            tk.Button(self._sub_frame, text=lbl, bg=bg, fg=fg,
-                      activebackground=CLR_BTN_HOVER, activeforeground=CLR_TEXT,
-                      relief="flat", padx=6, pady=2, anchor="w",
-                      font=("Segoe UI", 9), cursor="hand2",
-                      command=lambda i=idx: self._run(
-                          lambda: self._show_and_refresh(_bridge_post(f"/subtitle/{i}"))
-                      )).pack(fill="x", pady=1)
 
     def _show_and_refresh(self, result: dict) -> None:
         self._show(result)
         import time as _time
-        _time.sleep(0.3)  # give MPC-HC time to switch track
-        self._refresh_tracks()
+        _time.sleep(0.3)
+        self._refresh_status()
 
     # ── Action handlers ────────────────────────────────────────────────────────
 
