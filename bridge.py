@@ -9,6 +9,7 @@ Endpoints:
   GET  /ws                       — WebSocket: pushed state changes (JSON diffs)
   POST /command/{cmd}            — named playback command (see CMD dict)
   POST /seek?pos_ms=<int>        — absolute seek in milliseconds
+  POST /skip?offset_ms=<int>     — relative seek (±ms from current position)
   POST /volume?level=<0-100>     — set exact volume
   POST /audio/{index}            — select audio track by index
   POST /subtitle/{index}         — select subtitle track (-1 = disable)
@@ -74,16 +75,15 @@ CMD: dict[str, int] = {
     # Playback
     "play_pause": 889,
     "stop": 890,
-    "goto_start": 891,
-    "frame_step": 892,
-    "frame_step_back": 893,
+    "frame_step": 891,
+    "frame_step_back": 892,
     "speed_down": 894,
     "speed_up": 895,
     "speed_reset": 896,
-    "seek_fwd_small": 899,  # ~5 s
-    "seek_bwd_small": 900,
-    "seek_fwd_large": 901,  # ~1 min
-    "seek_bwd_large": 902,
+    "seek_bwd_small": 899,  # ~5 s
+    "seek_fwd_small": 900,
+    "seek_bwd_large": 903,  # ~1 min
+    "seek_fwd_large": 904,
     "prev": 921,
     "next": 922,
     # Volume
@@ -535,6 +535,26 @@ async def _seek(req: web.Request) -> web.Response:
     return web.json_response({"ok": True, "position_ms": pos_ms})
 
 
+async def _skip(req: web.Request) -> web.Response:
+    """Relative seek by ±offset_ms milliseconds. ?offset_ms=<int>"""
+    try:
+        offset_ms = int(req.rel_url.query["offset_ms"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "offset_ms required (milliseconds, may be negative)"}, status=400)
+    html = await _mpchc_get(req.app["session"], "/variables.html")
+    if html is None:
+        return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    v = _parse_variables(html)
+    pos_ms = int(v.get("position", 0))
+    dur_ms = int(v.get("duration", 0))
+    target_ms = max(0, min(dur_ms if dur_ms > 0 else pos_ms, pos_ms + offset_ms))
+    pos_sec = target_ms / 1000
+    _LOG.warning("_skip: offset_ms=%d  pos_ms=%d → target_ms=%d", offset_ms, pos_ms, target_ms)
+    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": f"{pos_sec:.3f}"}):
+        return web.json_response({"error": "Seek failed — MPC-HC not reachable"}, status=503)
+    return web.json_response({"ok": True, "position_ms": target_ms, "offset_ms": offset_ms})
+
+
 async def _set_volume(req: web.Request) -> web.Response:
     """Set exact volume. ?level=<0-100>"""
     try:
@@ -565,7 +585,9 @@ async def _subtitle_track(req: web.Request) -> web.Response:
         index = int(req.match_info["index"])
     except ValueError:
         return web.json_response({"error": "Invalid index"}, status=400)
-    cmd_id = CMD["sub_toggle"] if index < 0 else _SUB_BASE + index
+    if index < 0:
+        return web.json_response({"error": "Use subtitle cycling commands to toggle"}, status=400)
+    cmd_id = _SUB_BASE + index
     if not _post_wm_command(cmd_id):
         if not await _mpchc_command(req.app["session"], {"wm_command": cmd_id}):
             return web.json_response({"error": "MPC-HC not reachable"}, status=503)
@@ -717,6 +739,7 @@ def create_app() -> web.Application:
     app.router.add_get("/ws", _ws_handler)
     app.router.add_post("/command/{cmd}", _command)
     app.router.add_post("/seek", _seek)
+    app.router.add_post("/skip", _skip)
     app.router.add_post("/volume", _set_volume)
     app.router.add_post("/audio/{index}", _audio_track)
     app.router.add_post("/subtitle/{index}", _subtitle_track)

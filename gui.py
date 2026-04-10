@@ -709,6 +709,16 @@ class TestWindow(tk.Toplevel):
                  relief="flat", font=("Consolas", 10)).pack(side="left", padx=4)
         self._btn(sk_row, "Go", self._on_seek, width=4).pack(side="left")
 
+        skip_row = tk.Frame(skf, bg=CLR_BG)
+        skip_row.pack(pady=(4, 0))
+        self._lbl(skip_row, "Skip (s):").pack(side="left")
+        self._skip_var = tk.StringVar(value="30")
+        tk.Entry(skip_row, textvariable=self._skip_var, width=6,
+                 bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                 relief="flat", font=("Consolas", 10)).pack(side="left", padx=4)
+        self._btn(skip_row, "◀ Back", lambda: self._on_skip(-1), width=7).pack(side="left", padx=2)
+        self._btn(skip_row, "Fwd ▶", lambda: self._on_skip(1), width=7).pack(side="left", padx=2)
+
         # ── Volume ────────────────────────────────────────────────────────────
         vf = self._section(self, "Volume")
         vf.pack(fill="x", **pad)
@@ -962,6 +972,13 @@ class TestWindow(tk.Toplevel):
         except ValueError:
             return
         self._run(lambda: self._show(_bridge_post("/seek", {"pos_ms": pos_ms})))
+
+    def _on_skip(self, direction: int) -> None:
+        try:
+            offset_ms = int(float(self._skip_var.get()) * 1000) * direction
+        except ValueError:
+            return
+        self._run(lambda: self._show(_bridge_post("/skip", {"offset_ms": offset_ms})))
 
     def _on_set_volume(self) -> None:
         try:
