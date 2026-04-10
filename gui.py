@@ -367,7 +367,7 @@ class App(tk.Tk):
 def _bridge_get(path: str) -> dict:
     """Synchronous GET to the bridge. Returns parsed JSON or error dict."""
     try:
-        url = f"http://localhost:{BRIDGE_PORT}{path}"
+        url = f"http://127.0.0.1:{BRIDGE_PORT}{path}"
         with urllib.request.urlopen(url, timeout=3) as r:
             return json.loads(r.read().decode())
     except Exception as ex:  # pylint: disable=broad-exception-caught
@@ -377,7 +377,7 @@ def _bridge_get(path: str) -> dict:
 def _bridge_post(path: str, params: dict | None = None) -> dict:
     """Synchronous POST to the bridge. Returns parsed JSON or error dict."""
     try:
-        url = f"http://localhost:{BRIDGE_PORT}{path}"
+        url = f"http://127.0.0.1:{BRIDGE_PORT}{path}"
         if params:
             url += "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, data=b"", method="POST")
