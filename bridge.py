@@ -350,6 +350,22 @@ async def _debug_log(req: web.Request) -> web.Response:  # noqa: ARG001
     return web.json_response({"log": list(_LOG_BUFFER)})
 
 
+async def _debug_controls(req: web.Request) -> web.Response:
+    """Return raw /controls.html from MPC-HC for debugging."""
+    html = await _mpchc_get(req.app["session"], "/controls.html")
+    if html is None:
+        return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    return web.Response(text=html, content_type="text/html")
+
+
+async def _debug_variables(req: web.Request) -> web.Response:
+    """Return raw /variables.html from MPC-HC for debugging."""
+    html = await _mpchc_get(req.app["session"], "/variables.html")
+    if html is None:
+        return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    return web.Response(text=html, content_type="text/html")
+
+
 async def _index(req: web.Request) -> web.Response:  # noqa: ARG001
     """Root endpoint — redirect to /status."""
     raise web.HTTPFound("/status")
@@ -448,6 +464,8 @@ def create_app() -> web.Application:
     app.router.add_get("/tracks", _tracks)
     app.router.add_get("/commands", _commands_list)
     app.router.add_get("/debug/log", _debug_log)
+    app.router.add_get("/debug/controls", _debug_controls)
+    app.router.add_get("/debug/variables", _debug_variables)
     app.router.add_get("/ws", _ws_handler)
     app.router.add_post("/command/{cmd}", _command)
     app.router.add_post("/seek", _seek)

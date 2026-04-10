@@ -423,6 +423,21 @@ class TestWindow(tk.Toplevel):
         self._log.config(state="normal")
         self._log.delete("1.0", "end")
         self._log.insert("end", "\n".join(entries))
+
+    def _dump_raw(self, path: str) -> None:
+        try:
+            url = f"http://127.0.0.1:{BRIDGE_PORT}{path}"
+            with urllib.request.urlopen(url, timeout=3) as r:
+                text = r.read().decode(errors="replace")
+            self.after(0, lambda: self._write_log([f"=== {path} ===", text]))
+        except Exception as ex:  # pylint: disable=broad-exception-caught
+            self.after(0, lambda: self._write_log([f"Error fetching {path}: {ex}"]))
+
+    def _dump_controls(self) -> None:
+        self._dump_raw("/debug/controls")
+
+    def _dump_variables(self) -> None:
+        self._dump_raw("/debug/variables")
         self._log.see("end")
         self._log.config(state="disabled")
 
@@ -597,10 +612,22 @@ class TestWindow(tk.Toplevel):
             font=("Consolas", 8), relief="flat", state="disabled", wrap="none",
         )
         self._log.pack(fill="x")
-        tk.Button(log_row, text="↺  Refresh Log", command=lambda: self._run(self._refresh_log),
+        btn_row = tk.Frame(log_row, bg=CLR_BG)
+        btn_row.pack(fill="x", pady=(2, 0))
+        tk.Button(btn_row, text="↺  Refresh Log", command=lambda: self._run(self._refresh_log),
                   bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
                   relief="flat", padx=6, pady=2,
-                  font=("Segoe UI", 9), cursor="hand2").pack(anchor="e", pady=(2, 0))
+                  font=("Segoe UI", 9), cursor="hand2").pack(side="left")
+        tk.Button(btn_row, text="Dump controls.html",
+                  command=lambda: self._run(self._dump_controls),
+                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                  relief="flat", padx=6, pady=2,
+                  font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=(4, 0))
+        tk.Button(btn_row, text="Dump variables.html",
+                  command=lambda: self._run(self._dump_variables),
+                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                  relief="flat", padx=6, pady=2,
+                  font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=(4, 0))
 
         # centre window
         self.update_idletasks()
