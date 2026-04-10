@@ -228,9 +228,13 @@ async def _command(req: web.Request) -> web.Response:
     if cmd not in CMD:
         valid = sorted(CMD.keys())
         return web.json_response({"error": f"Unknown command '{cmd}'", "valid": valid}, status=400)
-    if not _post_wm_command(CMD[cmd]):
-        return web.json_response({"error": "MPC-HC window not found"}, status=503)
-    return web.json_response({"ok": True, "command": cmd, "wm_command": CMD[cmd]})
+    cmd_id = CMD[cmd]
+    if not _post_wm_command(cmd_id):
+        # Service runs in Session 0 — fall back to MPC-HC HTTP (works across sessions)
+        result = await _mpchc_get(req.app["session"], "/command.html", {"wm_command": cmd_id})
+        if result is None:
+            return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    return web.json_response({"ok": True, "command": cmd, "wm_command": cmd_id})
 
 
 async def _seek(req: web.Request) -> web.Response:
@@ -272,8 +276,11 @@ async def _audio_track(req: web.Request) -> web.Response:
         index = int(req.match_info["index"])
     except ValueError:
         return web.json_response({"error": "Invalid index"}, status=400)
-    if not _post_wm_command(_AUDIO_BASE + index):
-        return web.json_response({"error": "MPC-HC window not found"}, status=503)
+    cmd_id = _AUDIO_BASE + index
+    if not _post_wm_command(cmd_id):
+        result = await _mpchc_get(req.app["session"], "/command.html", {"wm_command": cmd_id})
+        if result is None:
+            return web.json_response({"error": "MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "audio_track": index})
 
 
@@ -285,7 +292,9 @@ async def _subtitle_track(req: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid index"}, status=400)
     cmd_id = CMD["sub_toggle"] if index < 0 else _SUB_BASE + index
     if not _post_wm_command(cmd_id):
-        return web.json_response({"error": "MPC-HC window not found"}, status=503)
+        result = await _mpchc_get(req.app["session"], "/command.html", {"wm_command": cmd_id})
+        if result is None:
+            return web.json_response({"error": "MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "subtitle_track": index})
 
 
