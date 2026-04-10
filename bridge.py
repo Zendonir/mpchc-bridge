@@ -109,6 +109,7 @@ _VIDEO_BASE = 50200
 MPCHC_PORT = 13579
 BRIDGE_PORT = 13580
 _TIMEOUT = ClientTimeout(total=3)
+_CMD_TIMEOUT = ClientTimeout(total=1)  # commands don't need a long wait
 
 
 # ── MPC-HC HTTP helpers ────────────────────────────────────────────────────────
@@ -125,6 +126,16 @@ async def _mpchc_get(
     except Exception:  # pylint: disable=broad-exception-caught
         pass
     return None
+
+
+async def _mpchc_command(session: ClientSession, params: dict) -> bool:
+    """Fire a command at MPC-HC and return immediately — don't read body."""
+    try:
+        url = f"http://localhost:{MPCHC_PORT}/command.html"
+        async with session.get(url, params=params, allow_redirects=False, timeout=_CMD_TIMEOUT) as r:
+            return r.status in (200, 302)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 def _parse_variables(html: str) -> dict[str, str]:
@@ -231,8 +242,7 @@ async def _command(req: web.Request) -> web.Response:
     cmd_id = CMD[cmd]
     if not _post_wm_command(cmd_id):
         # Service runs in Session 0 — fall back to MPC-HC HTTP (works across sessions)
-        result = await _mpchc_get(req.app["session"], "/command.html", {"wm_command": cmd_id})
-        if result is None:
+        if not await _mpchc_command(req.app["session"], {"wm_command": cmd_id}):
             return web.json_response({"error": "MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "command": cmd, "wm_command": cmd_id})
 
@@ -244,12 +254,7 @@ async def _seek(req: web.Request) -> web.Response:
     except (KeyError, ValueError):
         return web.json_response({"error": "pos_ms required (milliseconds)"}, status=400)
     # MPC-HC /command.html accepts position in seconds
-    result = await _mpchc_get(
-        req.app["session"],
-        "/command.html",
-        {"wm_command": -1, "position": f"{pos_ms / 1000:.3f}"},
-    )
-    if result is None:
+    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": f"{pos_ms / 1000:.3f}"}):
         return web.json_response({"error": "Seek failed — MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "position_ms": pos_ms})
 
@@ -260,12 +265,7 @@ async def _set_volume(req: web.Request) -> web.Response:
         level = max(0, min(100, int(req.rel_url.query["level"])))
     except (KeyError, ValueError):
         return web.json_response({"error": "level required (0-100)"}, status=400)
-    result = await _mpchc_get(
-        req.app["session"],
-        "/command.html",
-        {"wm_command": -2, "volume": level},
-    )
-    if result is None:
+    if not await _mpchc_command(req.app["session"], {"wm_command": -2, "volume": level}):
         return web.json_response({"error": "Volume set failed"}, status=503)
     return web.json_response({"ok": True, "volume": level})
 
@@ -278,8 +278,7 @@ async def _audio_track(req: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid index"}, status=400)
     cmd_id = _AUDIO_BASE + index
     if not _post_wm_command(cmd_id):
-        result = await _mpchc_get(req.app["session"], "/command.html", {"wm_command": cmd_id})
-        if result is None:
+        if not await _mpchc_command(req.app["session"], {"wm_command": cmd_id}):
             return web.json_response({"error": "MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "audio_track": index})
 
@@ -292,8 +291,7 @@ async def _subtitle_track(req: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid index"}, status=400)
     cmd_id = CMD["sub_toggle"] if index < 0 else _SUB_BASE + index
     if not _post_wm_command(cmd_id):
-        result = await _mpchc_get(req.app["session"], "/command.html", {"wm_command": cmd_id})
-        if result is None:
+        if not await _mpchc_command(req.app["session"], {"wm_command": cmd_id}):
             return web.json_response({"error": "MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "subtitle_track": index})
 
