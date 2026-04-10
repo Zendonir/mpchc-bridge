@@ -395,32 +395,46 @@ def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
 
 def _resolve_filepath(filepath: str) -> str:
     """
-    Resolve drive-letter paths that may not be visible to elevated processes.
-    Tries WNetGetConnectionW (network drives) then QueryDosDeviceW (subst drives).
-    e.g.  Y:\\Filme\\x.mkv  →  \\\\NAS\\Filme\\x.mkv   (network)
-          Y:\\Filme\\x.mkv  →  C:\\mnt\\Filme\\x.mkv    (subst)
+    Resolve a drive-letter path that may be invisible to elevated processes.
+    Tries four methods in order:
+      1. WNetGetConnectionW  — standard network drives
+      2. QueryDosDeviceW     — subst / virtual drives
+      3. HKCU\\Network registry — network drives mapped in user session
+      4. Return original path as fallback
     """
     if sys.platform != "win32" or len(filepath) < 3 or filepath[1] != ":":
         return filepath
-    drive = filepath[:2]
+    drive_letter = filepath[0].upper()
+    drive = drive_letter + ":"
     rest = filepath[2:]
     try:
         import ctypes
+        import winreg
 
-        # 1. Network drive via WNetGetConnectionW
+        # 1. WNetGetConnectionW (works when drive is visible in current context)
         buf = ctypes.create_unicode_buffer(512)
         size = ctypes.c_ulong(512)
         if ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size)) == 0 and buf.value:
             return buf.value + rest
 
-        # 2. Subst / virtual drive via QueryDosDeviceW  →  \??\C:\actual\path
+        # 2. QueryDosDeviceW (subst drives → \??\C:\real\path)
         buf2 = ctypes.create_unicode_buffer(1024)
         if ctypes.windll.kernel32.QueryDosDeviceW(drive, buf2, 1024) and buf2.value:
-            target = buf2.value  # e.g. \??\C:\Users\... or \??\UNC\server\share
+            target = buf2.value
             if target.startswith("\\??\\UNC\\"):
-                return "\\\\" + target[8:] + rest   # UNC network path
+                return "\\\\" + target[8:] + rest
             if target.startswith("\\??\\"):
-                return target[4:] + rest             # local / subst path
+                return target[4:] + rest
+
+        # 3. Registry HKCU\Network\{letter} — stored even when drive not in elevated token
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"Network\\{drive_letter}") as k:
+                unc = winreg.QueryValueEx(k, "RemotePath")[0]
+                if unc:
+                    return unc.rstrip("\\") + rest
+        except OSError:
+            pass
+
     except Exception:  # pylint: disable=broad-exception-caught
         pass
     return filepath
