@@ -393,8 +393,11 @@ def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
     return -1, pos + 1
 
 
-def _read_mkv_tracks(filepath: str) -> dict | None:
-    """Parse MKV EBML header for audio/subtitle track list. Returns None on failure."""
+def _read_mkv_tracks(filepath: str) -> tuple[dict | None, str]:
+    """
+    Parse MKV EBML header for audio/subtitle track list.
+    Returns (result_dict, "") on success, (None, error_msg) on failure.
+    """
     _ID_TRACKS = 0x1654AE6B
     _ID_CLUSTER = 0x1F43B675
     _ID_ENTRY = 0xAE
@@ -407,24 +410,34 @@ def _read_mkv_tracks(filepath: str) -> dict | None:
         with open(filepath, "rb") as fh:
             buf = fh.read(524288)
         n = len(buf)
-        if n < 8 or buf[:4] != b"\x1a\x45\xdf\xa3":
-            return None
+        if n < 8:
+            return None, f"file too small ({n} bytes)"
+        magic = buf[:4]
+        if magic != b"\x1a\x45\xdf\xa3":
+            return None, f"not EBML/MKV (magic={magic.hex()})"
+
         pos = 0
-        _, pos = _ebml_id(buf, pos)
+        eid, pos = _ebml_id(buf, pos)
         esz, pos = _ebml_size(buf, pos)
-        pos += esz
-        _, pos = _ebml_id(buf, pos)
+        pos += esz  # skip EBML header body
+
+        seg_id, pos = _ebml_id(buf, pos)
         esz, pos = _ebml_size(buf, pos)
-        seg_end = (pos + esz) if esz >= 0 else n
+        seg_end = (pos + esz) if 0 <= esz < n else n
+
         result: dict = {"audio": [], "subtitle": []}
+        scanned = 0
         while pos < min(seg_end, n) - 4:
             try:
                 eid, npos = _ebml_id(buf, pos)
                 esz, npos = _ebml_size(buf, npos)
-            except (IndexError, ValueError):
-                break
-            if esz < 0 or esz > n: esz = n - npos
+            except (IndexError, ValueError) as ex:
+                return None, f"EBML parse error at pos {pos}: {ex}"
+            if esz < 0 or npos + esz > n:
+                esz = n - npos
             el_end = npos + esz
+            scanned += 1
+
             if eid == _ID_CLUSTER:
                 break
             if eid == _ID_TRACKS:
@@ -436,11 +449,11 @@ def _read_mkv_tracks(filepath: str) -> dict | None:
                     except (IndexError, ValueError):
                         break
                     if tsz < 0: tsz = 0
-                    te_end = tpos2 + tsz
+                    te_end = min(tpos2 + tsz, n)
                     if tid == _ID_ENTRY:
                         t: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": ""}
                         epos = tpos2
-                        while epos < min(te_end, n) - 2:
+                        while epos < te_end - 2:
                             try:
                                 fid, epos2 = _ebml_id(buf, epos)
                                 fsz, epos2 = _ebml_size(buf, epos2)
@@ -454,18 +467,21 @@ def _read_mkv_tracks(filepath: str) -> dict | None:
                             elif fid == _ID_LANG: t["lang"]   = fd.decode("ascii", errors="replace").rstrip("\x00")
                             elif fid == _ID_CODEC: t["codec"] = fd.decode("ascii", errors="replace").rstrip("\x00")
                             epos = epos2 + fsz
-                        if t["type"] == 2:   # audio
+                        if t["type"] == 2:
                             t["pos"] = len(result["audio"])
                             result["audio"].append(t)
-                        elif t["type"] == 17:  # subtitle
+                        elif t["type"] == 17:
                             t["pos"] = len(result["subtitle"])
                             result["subtitle"].append(t)
                     tpos = te_end
-                return result
+                return result, ""
             pos = npos + esz
-    except Exception:  # pylint: disable=broad-exception-caught
-        pass
-    return None
+
+        if result["audio"] or result["subtitle"]:
+            return result, ""
+        return None, f"Tracks element not found (scanned {scanned} elements, read {n} bytes)"
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return None, f"{type(ex).__name__}: {ex}"
 
 
 def _match_track_pos(tracks: list, current_name: str) -> int:
@@ -802,9 +818,11 @@ class TestWindow(tk.Toplevel):
             if not filepath:
                 self.after(0, lambda: self._write_log(["Tracks: no file loaded"]))
                 return
-            mkv = _read_mkv_tracks(filepath)
+            mkv, err = _read_mkv_tracks(filepath)
             if mkv is None:
-                self.after(0, lambda: self._write_log([f"Tracks: cannot parse MKV: {filepath}"]))
+                self.after(0, lambda e=err, fp=filepath: self._write_log(
+                    [f"Tracks error: {e}", f"File: {fp}"]
+                ))
                 return
             cur_audio = status.get("audio_track", "")
             cur_sub = status.get("subtitle_track", "")
