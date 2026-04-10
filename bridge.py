@@ -309,6 +309,11 @@ async def _commands_list(req: web.Request) -> web.Response:  # noqa: ARG001
     return web.json_response({"commands": sorted(CMD.keys())})
 
 
+async def _index(req: web.Request) -> web.Response:  # noqa: ARG001
+    """Root endpoint — redirect to /status."""
+    raise web.HTTPFound("/status")
+
+
 # ── WebSocket push ─────────────────────────────────────────────────────────────
 
 _ws_clients: set[web.WebSocketResponse] = set()
@@ -397,6 +402,7 @@ def create_app() -> web.Application:
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
 
+    app.router.add_get("/", _index)
     app.router.add_get("/status", _status)
     app.router.add_get("/tracks", _tracks)
     app.router.add_get("/commands", _commands_list)
