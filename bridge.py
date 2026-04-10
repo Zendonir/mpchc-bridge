@@ -522,15 +522,30 @@ async def _command(req: web.Request) -> web.Response:
     return web.json_response({"ok": True, "command": cmd, "wm_command": cmd_id})
 
 
+def _ms_to_hmsms(ms: int) -> str:
+    """Convert milliseconds to MPC-HC position string HH:MM:SS:mmm.
+
+    MPC-HC /command.html?wm_command=-1 parses the position field with
+    _stscanf_s("%d%c%d%c%d%c%d") — four integers separated by any char.
+    Sending decimal seconds (e.g. "46.245") is NOT parsed correctly;
+    the colon-separated form "HH:MM:SS:mmm" always works.
+    """
+    ms = max(0, ms)
+    hours, rem = divmod(ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, millis = divmod(rem, 1_000)
+    return f"{hours}:{minutes:02d}:{seconds:02d}:{millis:03d}"
+
+
 async def _seek(req: web.Request) -> web.Response:
     """Seek to absolute position. ?pos_ms=<milliseconds>"""
     try:
         pos_ms = int(req.rel_url.query["pos_ms"])
     except (KeyError, ValueError):
         return web.json_response({"error": "pos_ms required (milliseconds)"}, status=400)
-    pos_sec = pos_ms / 1000
-    _LOG.warning("_seek: pos_ms=%d  pos_sec=%.3f", pos_ms, pos_sec)
-    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": f"{pos_sec:.3f}"}):
+    position = _ms_to_hmsms(pos_ms)
+    _LOG.warning("_seek: pos_ms=%d  position=%s", pos_ms, position)
+    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": position}):
         return web.json_response({"error": "Seek failed — MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "position_ms": pos_ms})
 
@@ -548,9 +563,9 @@ async def _skip(req: web.Request) -> web.Response:
     pos_ms = int(v.get("position", 0))
     dur_ms = int(v.get("duration", 0))
     target_ms = max(0, min(dur_ms if dur_ms > 0 else pos_ms, pos_ms + offset_ms))
-    pos_sec = target_ms / 1000
-    _LOG.warning("_skip: offset_ms=%d  pos_ms=%d → target_ms=%d", offset_ms, pos_ms, target_ms)
-    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": f"{pos_sec:.3f}"}):
+    position = _ms_to_hmsms(target_ms)
+    _LOG.warning("_skip: offset_ms=%d  pos_ms=%d → target_ms=%d  position=%s", offset_ms, pos_ms, target_ms, position)
+    if not await _mpchc_command(req.app["session"], {"wm_command": -1, "position": position}):
         return web.json_response({"error": "Seek failed — MPC-HC not reachable"}, status=503)
     return web.json_response({"ok": True, "position_ms": target_ms, "offset_ms": offset_ms})
 
