@@ -3,10 +3,14 @@ MPC-HC Bridge — GUI Installer / Control Panel
 Provides a simple tkinter window to install, uninstall, start and stop the service.
 """
 
+import json
 import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from tkinter import font, messagebox, scrolledtext
 
@@ -202,6 +206,9 @@ class App(tk.Tk):
         self._btn_firewall = self._btn(btn_frame, "🔓  Firewall", self._on_firewall)
         self._btn_firewall.pack(side="left", padx=(0, 6))
 
+        self._btn_test = self._btn(btn_frame, "🧪  Test Controls", self._on_test)
+        self._btn_test.pack(side="left", padx=(0, 6))
+
         self._btn_browser = self._btn(
             btn_frame, "🌐  Test in Browser", self._on_browser, accent=True
         )
@@ -349,6 +356,248 @@ class App(tk.Tk):
 
     def _on_browser(self) -> None:
         webbrowser.open(f"http://localhost:{BRIDGE_PORT}/status")
+
+    def _on_test(self) -> None:
+        TestWindow(self)
+
+
+# ── Test / control window ──────────────────────────────────────────────────────
+
+
+def _bridge_get(path: str) -> dict:
+    """Synchronous GET to the bridge. Returns parsed JSON or error dict."""
+    try:
+        url = f"http://localhost:{BRIDGE_PORT}{path}"
+        with urllib.request.urlopen(url, timeout=3) as r:
+            return json.loads(r.read().decode())
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return {"error": str(ex)}
+
+
+def _bridge_post(path: str, params: dict | None = None) -> dict:
+    """Synchronous POST to the bridge. Returns parsed JSON or error dict."""
+    try:
+        url = f"http://localhost:{BRIDGE_PORT}{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode())
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return {"error": str(ex)}
+
+
+class TestWindow(tk.Toplevel):
+    """Full test & control panel for the MPC-HC Bridge."""
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("MPC-HC Bridge — Test Controls")
+        self.resizable(False, False)
+        self.configure(bg=CLR_BG)
+        self._build_ui()
+        self._refresh_status()
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _run(self, fn) -> None:
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _cmd(self, name: str) -> None:
+        self._run(lambda: self._show(_bridge_post(f"/command/{name}")))
+
+    def _show(self, result: dict) -> None:
+        err = result.get("error")
+        if err:
+            self._set_status_text(f"Error: {err}", CLR_RED)
+
+    def _lbl(self, parent, text: str, fg=None, font_size: int = 9) -> tk.Label:
+        return tk.Label(parent, text=text, bg=CLR_BG, fg=fg or CLR_MUTED,
+                        font=("Segoe UI", font_size))
+
+    def _section(self, parent, title: str) -> tk.LabelFrame:
+        f = tk.LabelFrame(parent, text=title, bg=CLR_BG, fg=CLR_ACCENT,
+                          font=("Segoe UI", 9, "bold"),
+                          bd=1, relief="groove", padx=6, pady=4)
+        return f
+
+    def _btn(self, parent, text: str, cmd, width: int = 8) -> tk.Button:
+        return tk.Button(parent, text=text, command=cmd,
+                         bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                         activeforeground=CLR_TEXT, relief="flat",
+                         padx=4, pady=4, width=width,
+                         font=("Segoe UI", 9), cursor="hand2")
+
+    # ── UI ─────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        pad = {"padx": 10, "pady": 4}
+
+        # ── Status display ────────────────────────────────────────────────────
+        sf = self._section(self, "Status")
+        sf.pack(fill="x", **pad)
+
+        self._status_text = tk.StringVar(value="—")
+        tk.Label(sf, textvariable=self._status_text, bg=CLR_BG, fg=CLR_TEXT,
+                 font=("Consolas", 9), justify="left", wraplength=460).pack(anchor="w")
+
+        tk.Button(sf, text="↺  Refresh", command=self._refresh_status,
+                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                  relief="flat", padx=6, pady=2,
+                  font=("Segoe UI", 9), cursor="hand2").pack(anchor="e")
+
+        # ── Playback ──────────────────────────────────────────────────────────
+        pf = self._section(self, "Playback")
+        pf.pack(fill="x", **pad)
+
+        row1 = tk.Frame(pf, bg=CLR_BG)
+        row1.pack()
+        for text, name in [
+            ("⏮", "prev"), ("⏪⏪", "seek_bwd_large"), ("⏪", "seek_bwd_small"),
+            ("⏯", "play_pause"),
+            ("⏩", "seek_fwd_small"), ("⏩⏩", "seek_fwd_large"), ("⏭", "next"),
+        ]:
+            self._btn(row1, text, lambda n=name: self._cmd(n), width=4).pack(side="left", padx=2)
+
+        row2 = tk.Frame(pf, bg=CLR_BG)
+        row2.pack(pady=(4, 0))
+        for text, name in [
+            ("■ Stop", "stop"), ("⏏ Close", "close"),
+            ("◀ Frame", "frame_step_back"), ("Frame ▶", "frame_step"),
+            ("Speed −", "speed_down"), ("Speed ✕", "speed_reset"), ("Speed +", "speed_up"),
+        ]:
+            self._btn(row2, text, lambda n=name: self._cmd(n), width=7).pack(side="left", padx=2)
+
+        # ── Seek ──────────────────────────────────────────────────────────────
+        skf = self._section(self, "Seek to position")
+        skf.pack(fill="x", **pad)
+
+        sk_row = tk.Frame(skf, bg=CLR_BG)
+        sk_row.pack()
+        self._lbl(sk_row, "Position (s):").pack(side="left")
+        self._seek_var = tk.StringVar()
+        tk.Entry(sk_row, textvariable=self._seek_var, width=8,
+                 bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                 relief="flat", font=("Consolas", 10)).pack(side="left", padx=4)
+        self._btn(sk_row, "Go", self._on_seek, width=4).pack(side="left")
+
+        # ── Volume ────────────────────────────────────────────────────────────
+        vf = self._section(self, "Volume")
+        vf.pack(fill="x", **pad)
+
+        v_row = tk.Frame(vf, bg=CLR_BG)
+        v_row.pack()
+        for text, name in [("🔉 −", "vol_down"), ("🔊 +", "vol_up"), ("🔇 Mute", "mute")]:
+            self._btn(v_row, text, lambda n=name: self._cmd(n), width=7).pack(side="left", padx=2)
+
+        tk.Frame(v_row, bg=CLR_MUTED, width=1, height=24).pack(side="left", padx=8)
+
+        self._lbl(v_row, "Set level (0-100):").pack(side="left")
+        self._vol_var = tk.StringVar()
+        tk.Entry(v_row, textvariable=self._vol_var, width=5,
+                 bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                 relief="flat", font=("Consolas", 10)).pack(side="left", padx=4)
+        self._btn(v_row, "Set", self._on_set_volume, width=4).pack(side="left")
+
+        # ── Subtitles ─────────────────────────────────────────────────────────
+        subf = self._section(self, "Subtitles")
+        subf.pack(fill="x", **pad)
+
+        sub_row = tk.Frame(subf, bg=CLR_BG)
+        sub_row.pack()
+        for text, name in [
+            ("◀ Prev", "sub_prev"), ("Toggle", "sub_toggle"), ("Next ▶", "sub_next"),
+            ("Delay −", "sub_delay_minus"), ("Delay +", "sub_delay_plus"),
+        ]:
+            self._btn(sub_row, text, lambda n=name: self._cmd(n), width=7).pack(side="left", padx=2)
+
+        # ── Audio ─────────────────────────────────────────────────────────────
+        af = self._section(self, "Audio")
+        af.pack(fill="x", **pad)
+
+        a_row = tk.Frame(af, bg=CLR_BG)
+        a_row.pack()
+        for text, name in [
+            ("Next Track", "audio_next"),
+            ("Delay −", "audio_delay_minus"), ("Delay +", "audio_delay_plus"),
+        ]:
+            self._btn(a_row, text, lambda n=name: self._cmd(n), width=9).pack(side="left", padx=2)
+
+        # ── View ──────────────────────────────────────────────────────────────
+        vwf = self._section(self, "View")
+        vwf.pack(fill="x", **pad)
+
+        vw_row = tk.Frame(vwf, bg=CLR_BG)
+        vw_row.pack()
+        for text, name in [
+            ("Fullscreen", "fullscreen"), ("Fit", "zoom_fit"),
+            ("50%", "zoom_50"), ("100%", "zoom_100"), ("200%", "zoom_200"),
+        ]:
+            self._btn(vw_row, text, lambda n=name: self._cmd(n), width=9).pack(side="left", padx=2)
+
+        # ── Open file ─────────────────────────────────────────────────────────
+        of = self._section(self, "Open file in MPC-HC")
+        of.pack(fill="x", **pad)
+
+        o_row = tk.Frame(of, bg=CLR_BG)
+        o_row.pack(fill="x")
+        self._path_var = tk.StringVar()
+        tk.Entry(o_row, textvariable=self._path_var, width=46,
+                 bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                 relief="flat", font=("Consolas", 9)).pack(side="left", padx=(0, 4), fill="x", expand=True)
+        self._btn(o_row, "Open", self._on_open, width=5).pack(side="left")
+
+        # centre window
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"+{x}+{y}")
+
+    # ── Status refresh ─────────────────────────────────────────────────────────
+
+    def _set_status_text(self, text: str, color: str = CLR_TEXT) -> None:
+        self._status_text.set(text)
+
+    def _refresh_status(self) -> None:
+        def _do():
+            data = _bridge_get("/status")
+            if "error" in data:
+                self.after(0, lambda: self._set_status_text(f"⚠  {data['error']}", CLR_RED))
+                return
+            lines = [
+                f"State:     {data.get('state', '?').upper()}   "
+                f"Position:  {data.get('position_str', '?')} / {data.get('duration_str', '?')}",
+                f"Volume:    {data.get('volume', '?')}%   "
+                f"Muted:     {'Yes' if data.get('muted') else 'No'}   "
+                f"Rate:      {data.get('playback_rate', 1.0)}x",
+                f"Audio:     {data.get('audio_track') or '—'}",
+                f"Subtitle:  {data.get('subtitle_track') or '—'}",
+                f"File:      {data.get('file') or '—'}",
+            ]
+            self.after(0, lambda: self._set_status_text("\n".join(lines)))
+        self._run(_do)
+
+    # ── Action handlers ────────────────────────────────────────────────────────
+
+    def _on_seek(self) -> None:
+        try:
+            pos_ms = int(float(self._seek_var.get()) * 1000)
+        except ValueError:
+            return
+        self._run(lambda: self._show(_bridge_post("/seek", {"pos_ms": pos_ms})))
+
+    def _on_set_volume(self) -> None:
+        try:
+            level = max(0, min(100, int(self._vol_var.get())))
+        except ValueError:
+            return
+        self._run(lambda: self._show(_bridge_post("/volume", {"level": level})))
+
+    def _on_open(self) -> None:
+        path = self._path_var.get().strip()
+        if path:
+            self._run(lambda: self._show(_bridge_post("/open", {"path": path})))
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
