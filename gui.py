@@ -104,7 +104,7 @@ def fw_add_rule() -> tuple[bool, str]:
         "action=allow",
         "protocol=TCP",
         f"localport={BRIDGE_PORT}",
-        "profile=private,domain",
+        "profile=any",
         "description=Allows UC Remote to connect to MPC-HC Bridge",
     )
     return code == 0, out
@@ -198,6 +198,9 @@ class App(tk.Tk):
 
         self._btn_stop = self._btn(btn_frame, "■  Stop", self._on_stop)
         self._btn_stop.pack(side="left", padx=(0, 6))
+
+        self._btn_firewall = self._btn(btn_frame, "🔓  Firewall", self._on_firewall)
+        self._btn_firewall.pack(side="left", padx=(0, 6))
 
         self._btn_browser = self._btn(
             btn_frame, "🌐  Test in Browser", self._on_browser, accent=True
@@ -334,6 +337,14 @@ class App(tk.Tk):
             self._log_write(out)
             self._log_write("✔  Stopped." if ok else "✘  Failed.")
             self.after(0, self._refresh_status)
+        self._run_in_thread(_do)
+
+    def _on_firewall(self) -> None:
+        def _do():
+            self._log_write(f"Adding firewall rule for port {BRIDGE_PORT} (all profiles)…")
+            ok, out = fw_add_rule()
+            self._log_write(out)
+            self._log_write("✔  Firewall rule set." if ok else "✘  Failed — run as Administrator?")
         self._run_in_thread(_do)
 
     def _on_browser(self) -> None:
