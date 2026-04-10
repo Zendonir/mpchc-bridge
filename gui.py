@@ -395,20 +395,32 @@ def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
 
 def _resolve_filepath(filepath: str) -> str:
     """
-    Resolve a drive-letter path to a UNC path so elevated processes can access
-    network drives that are mapped only in the user session.
-    e.g.  Y:\\Filme\\x.mkv  →  \\\\NAS\\Filme\\x.mkv
+    Resolve drive-letter paths that may not be visible to elevated processes.
+    Tries WNetGetConnectionW (network drives) then QueryDosDeviceW (subst drives).
+    e.g.  Y:\\Filme\\x.mkv  →  \\\\NAS\\Filme\\x.mkv   (network)
+          Y:\\Filme\\x.mkv  →  C:\\mnt\\Filme\\x.mkv    (subst)
     """
     if sys.platform != "win32" or len(filepath) < 3 or filepath[1] != ":":
         return filepath
     drive = filepath[:2]
+    rest = filepath[2:]
     try:
         import ctypes
+
+        # 1. Network drive via WNetGetConnectionW
         buf = ctypes.create_unicode_buffer(512)
         size = ctypes.c_ulong(512)
-        ret = ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size))
-        if ret == 0 and buf.value:
-            return buf.value + filepath[2:]
+        if ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size)) == 0 and buf.value:
+            return buf.value + rest
+
+        # 2. Subst / virtual drive via QueryDosDeviceW  →  \??\C:\actual\path
+        buf2 = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.QueryDosDeviceW(drive, buf2, 1024) and buf2.value:
+            target = buf2.value  # e.g. \??\C:\Users\... or \??\UNC\server\share
+            if target.startswith("\\??\\UNC\\"):
+                return "\\\\" + target[8:] + rest   # UNC network path
+            if target.startswith("\\??\\"):
+                return target[4:] + rest             # local / subst path
     except Exception:  # pylint: disable=broad-exception-caught
         pass
     return filepath
