@@ -219,17 +219,90 @@ def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
     return -1, pos + 1  # unknown / all-ones = infinite
 
 
+def _parse_mkv_chapters(buf: bytes, pos: int, el_end: int, n: int) -> list[dict]:
+    """Parse a Chapters element body from buf[pos:el_end]. Returns list of
+    {"name": str, "time_ms": int} sorted by time, hidden chapters excluded."""
+    _ID_EDITION            = 0x45B9
+    _ID_CHAPTER_ATOM       = 0xB6
+    _ID_CHAPTER_TIME_START = 0x91  # nanoseconds as big-endian uint
+    _ID_CHAPTER_FLAG_HID   = 0x98
+    _ID_CHAPTER_DISPLAY    = 0x80
+    _ID_CHAP_STRING        = 0x85
+
+    chapters: list[dict] = []
+    while pos < min(el_end, n) - 2:
+        try:
+            eid, npos = _ebml_id(buf, pos)
+            esz, npos = _ebml_size(buf, npos)
+        except (IndexError, ValueError):
+            break
+        if esz < 0: esz = 0
+        edition_end = npos + esz
+        if eid == _ID_EDITION:
+            apos = npos
+            while apos < min(edition_end, n) - 2:
+                try:
+                    aid, apos2 = _ebml_id(buf, apos)
+                    asz, apos2 = _ebml_size(buf, apos2)
+                except (IndexError, ValueError):
+                    break
+                if asz < 0: asz = 0
+                atom_end = apos2 + asz
+                if aid == _ID_CHAPTER_ATOM:
+                    time_ns, hidden, names = 0, False, []
+                    fpos = apos2
+                    while fpos < min(atom_end, n) - 2:
+                        try:
+                            fid, fpos2 = _ebml_id(buf, fpos)
+                            fsz, fpos2 = _ebml_size(buf, fpos2)
+                        except (IndexError, ValueError):
+                            break
+                        if fsz < 0: fsz = 0
+                        fdata = buf[fpos2: fpos2 + fsz]
+                        if fid == _ID_CHAPTER_TIME_START:
+                            time_ns = int.from_bytes(fdata, "big")
+                        elif fid == _ID_CHAPTER_FLAG_HID:
+                            hidden = bool(int.from_bytes(fdata, "big"))
+                        elif fid == _ID_CHAPTER_DISPLAY:
+                            dpos = fpos2
+                            while dpos < min(fpos2 + fsz, n) - 2:
+                                try:
+                                    did, dpos2 = _ebml_id(buf, dpos)
+                                    dsz, dpos2 = _ebml_size(buf, dpos2)
+                                except (IndexError, ValueError):
+                                    break
+                                if dsz < 0: dsz = 0
+                                if did == _ID_CHAP_STRING:
+                                    names.append(buf[dpos2: dpos2 + dsz].decode("utf-8", errors="replace"))
+                                dpos = dpos2 + dsz
+                        fpos = fpos2 + fsz
+                    if not hidden and names:
+                        chapters.append({"name": names[0], "time_ms": time_ns // 1_000_000})
+                apos = atom_end
+        pos = edition_end
+    chapters.sort(key=lambda c: c["time_ms"])
+    return chapters
+
+
 def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
-    """
-    Parse an MKV file's EBML track list. Returns:
-      {"audio": [{"pos": N, "name": "...", "lang": "ger", "codec": "A_AC3"}, …],
-       "subtitle": […]}
-    pos = 0-based position in the track-type list (for cycling calculation).
-    Returns None if file cannot be read or is not MKV.
+    """Parse MKV EBML for tracks, video info, and chapters.
+
+    Returns:
+      {"audio":    [{"pos": N, "name": "...", "lang": "ger", "codec": "A_AC3"}, …],
+       "subtitle": […],
+       "video":    [{"pos": 0, "codec": "V_MPEGH/ISO/HEVC", "width": 1920, "height": 1080,
+                     "label": "1920x1080 H.265"}],
+       "chapters": [{"name": "Chapter 1", "time_ms": 0}, …]}
+    Returns None if the file cannot be read or is not MKV.
     """
     _ID_EBML     = 0x1A45DFA3
     _ID_SEGMENT  = 0x18538067
+    _ID_SEEKHEAD = 0x114D9B74
+    _ID_SEEK     = 0x4DBB
+    _ID_SEEKID   = 0x53AB
+    _ID_SEEKPOS  = 0x53AC
     _ID_TRACKS   = 0x1654AE6B
+    _ID_CHAPTERS = 0x1043A770
     _ID_CLUSTER  = 0x1F43B675
     _ID_ENTRY    = 0xAE
     _ID_NUM      = 0xD7
@@ -237,32 +310,42 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
     _ID_NAME     = 0x536E
     _ID_LANG     = 0x22B59C
     _ID_CODEC    = 0x86
+    _ID_VIDEO    = 0xE0
+    _ID_PX_W     = 0xB0
+    _ID_PX_H     = 0xBA
+    _TYPE_VIDEO  = 1
     _TYPE_AUDIO  = 2
     _TYPE_SUB    = 17
 
+    _CODEC_SHORT = {
+        "V_MPEGH/ISO/HEVC": "H.265", "V_MPEG4/ISO/AVC": "H.264",
+        "V_AV1": "AV1", "V_VP9": "VP9", "V_VP8": "VP8",
+        "V_MPEG2": "MPEG-2", "V_MPEG1": "MPEG-1",
+    }
+
     try:
         with open(filepath, "rb") as fh:
-            buf = fh.read(524288)  # 512 KB — always enough for track headers
+            buf = fh.read(524288)  # 512 KB
         n = len(buf)
         if n < 8 or buf[:4] != b"\x1a\x45\xdf\xa3":
             return None  # not MKV
 
         pos = 0
-        # Skip EBML header element
         _, pos = _ebml_id(buf, pos)
         esz, pos = _ebml_size(buf, pos)
-        pos += esz
+        pos += esz  # skip EBML header
 
-        # Expect Segment element
         eid, pos = _ebml_id(buf, pos)
         if eid != _ID_SEGMENT:
             return None
         esz, pos = _ebml_size(buf, pos)
+        seg_data_start = pos  # file offset where Segment body starts
         seg_end = (pos + esz) if esz >= 0 else n
 
-        result: dict[str, list] = {"audio": [], "subtitle": []}
+        result: dict[str, list] = {"audio": [], "subtitle": [], "video": [], "chapters": []}
+        chapters_offset = -1  # SeekPosition relative to seg_data_start
 
-        # Scan Segment children for Tracks (always before first Cluster)
+        # Scan all pre-Cluster Segment children
         while pos < min(seg_end, n) - 4:
             try:
                 eid, npos = _ebml_id(buf, pos)
@@ -274,8 +357,43 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
             el_end = npos + esz
 
             if eid == _ID_CLUSTER:
-                break  # tracks always precede first cluster
-            if eid == _ID_TRACKS:
+                break
+
+            elif eid == _ID_SEEKHEAD:
+                # Extract chapters file position from SeekHead
+                spos = npos
+                while spos < min(el_end, n) - 2:
+                    try:
+                        sid, spos2 = _ebml_id(buf, spos)
+                        ssz, spos2 = _ebml_size(buf, spos2)
+                    except (IndexError, ValueError):
+                        break
+                    if ssz < 0: ssz = 0
+                    se_end = spos2 + ssz
+                    if sid == _ID_SEEK:
+                        sk_id, sk_off = 0, -1
+                        epos = spos2
+                        while epos < min(se_end, n) - 2:
+                            try:
+                                fid, epos2 = _ebml_id(buf, epos)
+                                fsz, epos2 = _ebml_size(buf, epos2)
+                            except (IndexError, ValueError):
+                                break
+                            if fsz < 0: fsz = 0
+                            fdata = buf[epos2: epos2 + fsz]
+                            if fid == _ID_SEEKID:
+                                sk_id = int.from_bytes(fdata, "big")
+                            elif fid == _ID_SEEKPOS:
+                                sk_off = int.from_bytes(fdata, "big")
+                            epos = epos2 + fsz
+                        if sk_id == _ID_CHAPTERS and sk_off >= 0:
+                            chapters_offset = sk_off
+                    spos = se_end
+
+            elif eid == _ID_CHAPTERS:
+                result["chapters"] = _parse_mkv_chapters(buf, npos, el_end, n)
+
+            elif eid == _ID_TRACKS:
                 tpos = npos
                 while tpos < min(el_end, n) - 2:
                     try:
@@ -286,7 +404,8 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
                     if tsz < 0: tsz = 0
                     te_end = tpos2 + tsz
                     if tid == _ID_ENTRY:
-                        track: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": ""}
+                        track: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": "",
+                                       "width": 0, "height": 0}
                         epos = tpos2
                         while epos < min(te_end, n) - 2:
                             try:
@@ -296,21 +415,60 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
                                 break
                             if fsz < 0: fsz = 0
                             fdata = buf[epos2: epos2 + fsz]
-                            if fid == _ID_NUM:   track["number"] = int.from_bytes(fdata, "big")
+                            if fid == _ID_NUM:    track["number"] = int.from_bytes(fdata, "big")
                             elif fid == _ID_TYPE: track["type"]   = int.from_bytes(fdata, "big")
                             elif fid == _ID_NAME: track["name"]   = fdata.decode("utf-8", errors="replace")
                             elif fid == _ID_LANG: track["lang"]   = fdata.decode("ascii", errors="replace").rstrip("\x00")
                             elif fid == _ID_CODEC: track["codec"] = fdata.decode("ascii", errors="replace").rstrip("\x00")
+                            elif fid == _ID_VIDEO:
+                                vpos = epos2
+                                while vpos < min(epos2 + fsz, n) - 2:
+                                    try:
+                                        vid, vpos2 = _ebml_id(buf, vpos)
+                                        vsz, vpos2 = _ebml_size(buf, vpos2)
+                                    except (IndexError, ValueError):
+                                        break
+                                    if vsz < 0: vsz = 0
+                                    vdata = buf[vpos2: vpos2 + vsz]
+                                    if vid == _ID_PX_W: track["width"]  = int.from_bytes(vdata, "big")
+                                    elif vid == _ID_PX_H: track["height"] = int.from_bytes(vdata, "big")
+                                    vpos = vpos2 + vsz
                             epos = epos2 + fsz
-                        if track["type"] == _TYPE_AUDIO:
+                        if track["type"] == _TYPE_VIDEO:
+                            short = _CODEC_SHORT.get(track["codec"], track["codec"].split("/")[-1])
+                            track["pos"] = len(result["video"])
+                            track["label"] = f"{track['width']}x{track['height']} {short}"
+                            result["video"].append(track)
+                        elif track["type"] == _TYPE_AUDIO:
                             track["pos"] = len(result["audio"])
                             result["audio"].append(track)
                         elif track["type"] == _TYPE_SUB:
                             track["pos"] = len(result["subtitle"])
                             result["subtitle"].append(track)
                     tpos = te_end
-                return result
+
             pos = npos + esz
+
+        # Chapters via SeekHead: may lie outside the initial 512 KB window
+        if not result["chapters"] and chapters_offset >= 0:
+            chap_abs = seg_data_start + chapters_offset
+            try:
+                with open(filepath, "rb") as fh:
+                    fh.seek(chap_abs)
+                    hdr = fh.read(12)
+                cpos = 0
+                c_eid, cpos = _ebml_id(hdr, cpos)
+                c_esz, cpos = _ebml_size(hdr, cpos)
+                if c_eid == _ID_CHAPTERS and c_esz > 0:
+                    read_sz = min(c_esz, 262144)  # cap at 256 KB
+                    with open(filepath, "rb") as fh:
+                        fh.seek(chap_abs + cpos)
+                        cbuf = fh.read(read_sz)
+                    result["chapters"] = _parse_mkv_chapters(cbuf, 0, len(cbuf), len(cbuf))
+            except Exception as ex:  # pylint: disable=broad-exception-caught
+                _LOG.warning("chapters read at %d failed: %s", chap_abs, ex)
+
+        return result
 
     except Exception as ex:  # pylint: disable=broad-exception-caught
         _LOG.warning("_read_mkv_tracks %s: %s", filepath, ex)
@@ -443,6 +601,8 @@ async def _tracks(req: web.Request) -> web.Response:
     return web.json_response({
         "audio": mkv["audio"],
         "subtitle": mkv["subtitle"],
+        "video": mkv.get("video", []),
+        "chapters": mkv.get("chapters", []),
         "current_audio_pos": cur_audio_pos,
         "current_sub_pos": cur_sub_pos,
         "filepath": filepath,
