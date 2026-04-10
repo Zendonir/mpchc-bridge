@@ -393,6 +393,27 @@ def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
     return -1, pos + 1
 
 
+def _resolve_filepath(filepath: str) -> str:
+    """
+    Resolve a drive-letter path to a UNC path so elevated processes can access
+    network drives that are mapped only in the user session.
+    e.g.  Y:\\Filme\\x.mkv  →  \\\\NAS\\Filme\\x.mkv
+    """
+    if sys.platform != "win32" or len(filepath) < 3 or filepath[1] != ":":
+        return filepath
+    drive = filepath[:2]
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(512)
+        size = ctypes.c_ulong(512)
+        ret = ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size))
+        if ret == 0 and buf.value:
+            return buf.value + filepath[2:]
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return filepath
+
+
 def _read_mkv_tracks(filepath: str) -> tuple[dict | None, str]:
     """
     Parse MKV EBML header for audio/subtitle track list.
@@ -406,8 +427,9 @@ def _read_mkv_tracks(filepath: str) -> tuple[dict | None, str]:
     _ID_NAME = 0x536E
     _ID_LANG = 0x22B59C
     _ID_CODEC = 0x86
+    resolved = _resolve_filepath(filepath)
     try:
-        with open(filepath, "rb") as fh:
+        with open(resolved, "rb") as fh:
             buf = fh.read(524288)
         n = len(buf)
         if n < 8:
@@ -738,6 +760,18 @@ class TestWindow(tk.Toplevel):
                   bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
                   relief="flat", padx=4, pady=1, font=("Segoe UI", 9), cursor="hand2").pack(side="right")
 
+        # Manual path override (if automatic filepath from MPC-HC is not accessible)
+        ov_row = tk.Frame(tf, bg=CLR_BG)
+        ov_row.pack(fill="x", pady=(2, 4))
+        self._lbl(ov_row, "Path override:").pack(side="left", padx=(0, 4))
+        self._path_override = tk.StringVar()
+        tk.Entry(ov_row, textvariable=self._path_override, width=38,
+                 bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                 relief="flat", font=("Consolas", 8)).pack(side="left", fill="x", expand=True)
+        tk.Button(ov_row, text="Use", command=lambda: self._run(self._refresh_tracks),
+                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                  relief="flat", padx=4, pady=1, font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=(4, 0))
+
         self._audio_frame = tk.Frame(tf, bg=CLR_BG)
         self._audio_frame.pack(fill="x", pady=(2, 4))
         tk.Label(self._audio_frame, text="—", bg=CLR_BG, fg=CLR_MUTED,
@@ -818,11 +852,14 @@ class TestWindow(tk.Toplevel):
             if not filepath:
                 self.after(0, lambda: self._write_log(["Tracks: no file loaded"]))
                 return
+            resolved = _resolve_filepath(filepath)
             mkv, err = _read_mkv_tracks(filepath)
             if mkv is None:
-                self.after(0, lambda e=err, fp=filepath: self._write_log(
-                    [f"Tracks error: {e}", f"File: {fp}"]
-                ))
+                self.after(0, lambda e=err, fp=filepath, rp=resolved: self._write_log([
+                    f"Tracks error: {e}",
+                    f"Original path: {fp}",
+                    f"Resolved path: {rp}",
+                ]))
                 return
             cur_audio = status.get("audio_track", "")
             cur_sub = status.get("subtitle_track", "")
