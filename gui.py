@@ -72,6 +72,50 @@ def svc_uninstall() -> tuple[bool, str]:
     return code == 0, out
 
 
+# ── Windows Firewall helpers ───────────────────────────────────────────────────
+
+FW_RULE_NAME = "MPC-HC Bridge (Port 13580)"
+
+
+def _netsh(*args: str, timeout: int = 10) -> tuple[int, str]:
+    """Run a netsh command and return (returncode, output)."""
+    try:
+        r = subprocess.run(
+            ["netsh"] + list(args),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return -1, f"Timeout after {timeout}s"
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return -1, str(ex)
+
+
+def fw_add_rule() -> tuple[bool, str]:
+    """Add inbound TCP firewall rule for port 13580."""
+    # Remove existing rule first to avoid duplicates
+    _netsh("advfirewall", "firewall", "delete", "rule", f'name={FW_RULE_NAME}')
+    code, out = _netsh(
+        "advfirewall", "firewall", "add", "rule",
+        f"name={FW_RULE_NAME}",
+        "dir=in",
+        "action=allow",
+        "protocol=TCP",
+        f"localport={BRIDGE_PORT}",
+        "profile=private,domain",
+        "description=Allows UC Remote to connect to MPC-HC Bridge",
+    )
+    return code == 0, out
+
+
+def fw_remove_rule() -> tuple[bool, str]:
+    """Remove the inbound firewall rule for port 13580."""
+    code, out = _netsh("advfirewall", "firewall", "delete", "rule", f"name={FW_RULE_NAME}")
+    return code == 0, out
+
+
 def svc_start() -> tuple[bool, str]:
     code, out = _sc("start", SVC_NAME, timeout=30)
     return code == 0, out
@@ -249,6 +293,10 @@ class App(tk.Tk):
                 self._log_write(out2)
                 if ok2:
                     self._log_write("✔  Service started.")
+                self._log_write(f"Adding firewall rule for port {BRIDGE_PORT}…")
+                ok3, out3 = fw_add_rule()
+                self._log_write(out3)
+                self._log_write(f"✔  Firewall rule added." if ok3 else "⚠  Firewall rule failed — add manually if needed.")
             else:
                 self._log_write("✘  Install failed — run as Administrator?")
             self.after(0, self._refresh_status)
@@ -264,6 +312,9 @@ class App(tk.Tk):
             ok, out = svc_uninstall()
             self._log_write(out)
             self._log_write("✔  Done." if ok else "✘  Failed.")
+            self._log_write("Removing firewall rule…")
+            _, out2 = fw_remove_rule()
+            self._log_write(out2)
             self.after(0, self._refresh_status)
         self._run_in_thread(_do)
 
