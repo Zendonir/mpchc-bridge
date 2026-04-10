@@ -364,6 +364,140 @@ class App(tk.Tk):
 # ── Test / control window ──────────────────────────────────────────────────────
 
 
+# ── MKV EBML track parser (runs in GUI process = user context, can access mapped drives) ──
+
+
+def _ebml_id(buf: bytes, pos: int) -> tuple[int, int]:
+    b = buf[pos]
+    if b >= 0x80: return b, pos + 1
+    if b >= 0x40: return (b << 8) | buf[pos + 1], pos + 2
+    if b >= 0x20: return (b << 16) | (buf[pos + 1] << 8) | buf[pos + 2], pos + 3
+    if b >= 0x10: return (b << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3], pos + 4
+    raise ValueError(f"bad EBML ID {b:#x}")
+
+
+def _ebml_size(buf: bytes, pos: int) -> tuple[int, int]:
+    b = buf[pos]
+    if b >= 0x80: return b & 0x7F, pos + 1
+    if b >= 0x40: return ((b & 0x3F) << 8) | buf[pos + 1], pos + 2
+    if b >= 0x20: return ((b & 0x1F) << 16) | (buf[pos + 1] << 8) | buf[pos + 2], pos + 3
+    if b >= 0x10: return ((b & 0x0F) << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3], pos + 4
+    if b >= 0x08:
+        v = b & 0x07
+        for i in range(4): v = (v << 8) | buf[pos + 1 + i]
+        return v, pos + 5
+    if b == 0x01:
+        v = 0
+        for i in range(7): v = (v << 8) | buf[pos + 1 + i]
+        return v, pos + 8
+    return -1, pos + 1
+
+
+def _read_mkv_tracks(filepath: str) -> dict | None:
+    """Parse MKV EBML header for audio/subtitle track list. Returns None on failure."""
+    _ID_TRACKS = 0x1654AE6B
+    _ID_CLUSTER = 0x1F43B675
+    _ID_ENTRY = 0xAE
+    _ID_NUM = 0xD7
+    _ID_TYPE = 0x83
+    _ID_NAME = 0x536E
+    _ID_LANG = 0x22B59C
+    _ID_CODEC = 0x86
+    try:
+        with open(filepath, "rb") as fh:
+            buf = fh.read(524288)
+        n = len(buf)
+        if n < 8 or buf[:4] != b"\x1a\x45\xdf\xa3":
+            return None
+        pos = 0
+        _, pos = _ebml_id(buf, pos)
+        esz, pos = _ebml_size(buf, pos)
+        pos += esz
+        _, pos = _ebml_id(buf, pos)
+        esz, pos = _ebml_size(buf, pos)
+        seg_end = (pos + esz) if esz >= 0 else n
+        result: dict = {"audio": [], "subtitle": []}
+        while pos < min(seg_end, n) - 4:
+            try:
+                eid, npos = _ebml_id(buf, pos)
+                esz, npos = _ebml_size(buf, npos)
+            except (IndexError, ValueError):
+                break
+            if esz < 0 or esz > n: esz = n - npos
+            el_end = npos + esz
+            if eid == _ID_CLUSTER:
+                break
+            if eid == _ID_TRACKS:
+                tpos = npos
+                while tpos < min(el_end, n) - 2:
+                    try:
+                        tid, tpos2 = _ebml_id(buf, tpos)
+                        tsz, tpos2 = _ebml_size(buf, tpos2)
+                    except (IndexError, ValueError):
+                        break
+                    if tsz < 0: tsz = 0
+                    te_end = tpos2 + tsz
+                    if tid == _ID_ENTRY:
+                        t: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": ""}
+                        epos = tpos2
+                        while epos < min(te_end, n) - 2:
+                            try:
+                                fid, epos2 = _ebml_id(buf, epos)
+                                fsz, epos2 = _ebml_size(buf, epos2)
+                            except (IndexError, ValueError):
+                                break
+                            if fsz < 0: fsz = 0
+                            fd = buf[epos2: epos2 + fsz]
+                            if fid == _ID_NUM:    t["number"] = int.from_bytes(fd, "big")
+                            elif fid == _ID_TYPE: t["type"]   = int.from_bytes(fd, "big")
+                            elif fid == _ID_NAME: t["name"]   = fd.decode("utf-8", errors="replace")
+                            elif fid == _ID_LANG: t["lang"]   = fd.decode("ascii", errors="replace").rstrip("\x00")
+                            elif fid == _ID_CODEC: t["codec"] = fd.decode("ascii", errors="replace").rstrip("\x00")
+                            epos = epos2 + fsz
+                        if t["type"] == 2:   # audio
+                            t["pos"] = len(result["audio"])
+                            result["audio"].append(t)
+                        elif t["type"] == 17:  # subtitle
+                            t["pos"] = len(result["subtitle"])
+                            result["subtitle"].append(t)
+                    tpos = te_end
+                return result
+            pos = npos + esz
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return None
+
+
+def _match_track_pos(tracks: list, current_name: str) -> int:
+    """Match MPC-HC current track string to MKV track list. Returns 0-based pos."""
+    if not tracks:
+        return 0
+    cur = current_name.lower()
+    import re as _re
+    lang_m = _re.search(r'\[([a-z]{3})\]', cur)
+    cur_lang = lang_m.group(1) if lang_m else ""
+    codec_map = {
+        "ac3": "A_AC3", "dts": "A_DTS", "aac": "A_AAC", "flac": "A_FLAC",
+        "truehd": "A_TRUEHD", "eac3": "A_EAC3", "mp3": "A_MPEG", "opus": "A_OPUS",
+        "vorbis": "A_VORBIS", "vobsub": "S_VOBSUB", "ass": "S_TEXT/ASS",
+        "subrip": "S_TEXT/UTF8", "pgs": "S_HDMV/PGS",
+    }
+    cur_codec_prefix = ""
+    for hint, codec in codec_map.items():
+        if hint in cur:
+            cur_codec_prefix = codec.split("/")[0]
+            break
+    best_pos, best_score = 0, -1
+    for t in tracks:
+        score = 0
+        if cur_lang and t.get("lang", "").lower() == cur_lang: score += 10
+        if cur_codec_prefix and t.get("codec", "").upper().startswith(cur_codec_prefix): score += 5
+        if t.get("name") and t["name"].lower() in cur: score += 3
+        if score > best_score:
+            best_score, best_pos = score, t["pos"]
+    return best_pos
+
+
 def _bridge_get(path: str) -> dict:
     """Synchronous GET to the bridge. Returns parsed JSON or error dict."""
     try:
@@ -660,11 +794,27 @@ class TestWindow(tk.Toplevel):
 
     def _refresh_tracks(self) -> None:
         def _do():
-            data = _bridge_get("/tracks")
-            if "error" in data:
-                self.after(0, lambda: self._write_log([f"Tracks: {data['error']}"]))
+            status = _bridge_get("/status")
+            if "error" in status:
+                self.after(0, lambda: self._write_log([f"Tracks: {status['error']}"]))
                 return
-            self.after(0, lambda: self._build_track_buttons(data))
+            filepath = status.get("filepath", "")
+            if not filepath:
+                self.after(0, lambda: self._write_log(["Tracks: no file loaded"]))
+                return
+            mkv = _read_mkv_tracks(filepath)
+            if mkv is None:
+                self.after(0, lambda: self._write_log([f"Tracks: cannot parse MKV: {filepath}"]))
+                return
+            cur_audio = status.get("audio_track", "")
+            cur_sub = status.get("subtitle_track", "")
+            cur_audio_pos = _match_track_pos(mkv["audio"], cur_audio)
+            cur_sub_pos = _match_track_pos(mkv["subtitle"], cur_sub)
+            for t in mkv["audio"]:
+                t["selected"] = t["pos"] == cur_audio_pos
+            for t in mkv["subtitle"]:
+                t["selected"] = t["pos"] == cur_sub_pos
+            self.after(0, lambda: self._build_track_buttons(mkv))
         self._run(_do)
 
     def _build_track_buttons(self, data: dict) -> None:
@@ -692,8 +842,9 @@ class TestWindow(tk.Toplevel):
                           activebackground=CLR_BTN_HOVER, activeforeground=CLR_TEXT,
                           relief="flat", padx=6, pady=3, anchor="w", width=50,
                           font=("Consolas", 8), cursor="hand2",
-                          command=lambda k=kind, p=pos: self._run(
-                              lambda: self._select_track_and_refresh(k, p)
+                          command=lambda k=kind, p=pos, tot=len(tracks),
+                                         cp=next((x["pos"] for x in tracks if x.get("selected")), 0): self._run(
+                              lambda k=k, p=p, tot=tot, cp=cp: self._select_track_and_refresh(k, p, tot, cp)
                           )).pack(fill="x", pady=1)
             # cycling controls below the list
             ctrl = tk.Frame(frame, bg=CLR_BG)
@@ -701,14 +852,20 @@ class TestWindow(tk.Toplevel):
             self._btn(ctrl, "◀ Prev", lambda c=cmd_prev: self._cmd(c), width=6).pack(side="left", padx=(0, 2))
             self._btn(ctrl, "Next ▶", lambda c=cmd_next: self._cmd(c), width=6).pack(side="left")
 
-    def _select_track_and_refresh(self, kind: str, pos: int) -> None:
-        result = _bridge_post(f"/{kind}/select/{pos}")
-        self._show(result)
+    def _select_track_and_refresh(self, kind: str, target_pos: int, total: int, cur_pos: int) -> None:
         import time as _time
-        _time.sleep(0.4)
-        data = _bridge_get("/tracks")
-        if "error" not in data:
-            self.after(0, lambda: self._build_track_buttons(data))
+        cmd_next = "audio_next" if kind == "audio" else "sub_next"
+        cmd_prev = "audio_prev" if kind == "audio" else "sub_prev"
+        steps_fwd = (target_pos - cur_pos) % total
+        steps_bwd = (cur_pos - target_pos) % total
+        if steps_fwd == 0:
+            return
+        cmd, steps = (cmd_next, steps_fwd) if steps_fwd <= steps_bwd else (cmd_prev, steps_bwd)
+        for _ in range(steps):
+            _bridge_post(f"/command/{cmd}")
+            _time.sleep(0.08)
+        _time.sleep(0.3)
+        self._refresh_tracks()
 
     def _show_and_refresh(self, result: dict) -> None:
         self._show(result)
