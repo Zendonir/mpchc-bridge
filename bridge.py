@@ -199,10 +199,15 @@ async def _status(req: web.Request) -> web.Response:
             "state_id": state_id,
             "position_ms": int(v.get("position", 0)),
             "duration_ms": int(v.get("duration", 0)),
+            "position_str": v.get("positionstring", ""),
+            "duration_str": v.get("durationstring", ""),
             "volume": int(v.get("volumelevel", 0)),
             "muted": v.get("muted", "0") == "1",
+            "playback_rate": float(v.get("playbackrate", "1.0")),
             "file": v.get("file", ""),
             "filepath": v.get("filepath", ""),
+            "audio_track": v.get("audiotrack", ""),
+            "subtitle_track": v.get("subtitletrack", ""),
         }
     )
 
