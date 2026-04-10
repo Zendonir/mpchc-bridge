@@ -111,6 +111,15 @@ def main() -> None:
     """Dispatch based on arguments, or launch GUI if none given."""
     args = sys.argv[1:]
 
+    # --service → called by Windows SCM, start the service dispatcher
+    if args and args[0] == "--service":
+        if not _PYWIN32_AVAILABLE:
+            sys.exit(1)
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(MpcHcBridgeService)
+        servicemanager.StartServiceCtrlDispatcher()
+        return
+
     # No arguments → open GUI
     if not args:
         from gui import main as gui_main
@@ -138,16 +147,9 @@ def main() -> None:
 
     if not _PYWIN32_AVAILABLE:
         print("ERROR: pywin32 is required for service management.")
-        print("       Install with: pip install pywin32")
         sys.exit(1)
 
-    # SCM dispatcher (called by Windows when starting the service)
-    if len(sys.argv) == 1:
-        servicemanager.Initialize()
-        servicemanager.PrepareToHostSingle(MpcHcBridgeService)
-        servicemanager.StartServiceCtrlDispatcher()
-    else:
-        win32serviceutil.HandleCommandLine(MpcHcBridgeService)
+    win32serviceutil.HandleCommandLine(MpcHcBridgeService)
 
 
 if __name__ == "__main__":

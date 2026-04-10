@@ -16,16 +16,18 @@ SVC_NAME = "MpcHcBridge"
 # ── Service helpers (via sc.exe — no pywin32 needed in the GUI thread) ─────────
 
 
-def _sc(*args: str) -> tuple[int, str]:
+def _sc(*args: str, timeout: int = 10) -> tuple[int, str]:
     """Run an sc.exe command and return (returncode, output)."""
     try:
         r = subprocess.run(
             ["sc"] + list(args),
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
-        return r.returncode, (r.stdout + r.stderr).strip()
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return -1, f"Timeout after {timeout}s — service may still be starting"
     except Exception as ex:  # pylint: disable=broad-exception-caught
         return -1, str(ex)
 
@@ -52,9 +54,9 @@ def svc_install() -> tuple[bool, str]:
     exe = _self_exe()
     code, out = _sc(
         "create", SVC_NAME,
-        f"binPath={exe}",
+        f"binPath={exe} --service",
         "start=auto",
-        f"DisplayName=MPC-HC Control Bridge",
+        "DisplayName=MPC-HC Control Bridge",
     )
     if code != 0:
         return False, out
@@ -71,7 +73,7 @@ def svc_uninstall() -> tuple[bool, str]:
 
 
 def svc_start() -> tuple[bool, str]:
-    code, out = _sc("start", SVC_NAME)
+    code, out = _sc("start", SVC_NAME, timeout=30)
     return code == 0, out
 
 
