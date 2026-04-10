@@ -27,6 +27,22 @@ from aiohttp import ClientSession, ClientTimeout, web
 
 _LOG = logging.getLogger(__name__)
 
+# ── In-memory log ring buffer (for /debug/log endpoint) ───────────────────────
+import collections
+
+_LOG_BUFFER: collections.deque = collections.deque(maxlen=100)
+
+
+class _BufHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        _LOG_BUFFER.append(f"{self.formatter.formatTime(record, '%H:%M:%S')}  {record.getMessage()}")
+
+
+_buf_handler = _BufHandler()
+_buf_handler.setFormatter(logging.Formatter())
+logging.getLogger().addHandler(_buf_handler)
+logging.getLogger().setLevel(logging.WARNING)
+
 # ── win32 via ctypes (no external dependency) ──────────────────────────────────
 if sys.platform == "win32":
     import ctypes
@@ -328,6 +344,11 @@ async def _commands_list(req: web.Request) -> web.Response:  # noqa: ARG001
     return web.json_response({"commands": sorted(CMD.keys())})
 
 
+async def _debug_log(req: web.Request) -> web.Response:  # noqa: ARG001
+    """Return last 100 log entries as JSON."""
+    return web.json_response({"log": list(_LOG_BUFFER)})
+
+
 async def _index(req: web.Request) -> web.Response:  # noqa: ARG001
     """Root endpoint — redirect to /status."""
     raise web.HTTPFound("/status")
@@ -425,6 +446,7 @@ def create_app() -> web.Application:
     app.router.add_get("/status", _status)
     app.router.add_get("/tracks", _tracks)
     app.router.add_get("/commands", _commands_list)
+    app.router.add_get("/debug/log", _debug_log)
     app.router.add_get("/ws", _ws_handler)
     app.router.add_post("/command/{cmd}", _command)
     app.router.add_post("/seek", _seek)

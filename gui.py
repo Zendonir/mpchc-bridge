@@ -410,6 +410,20 @@ class TestWindow(tk.Toplevel):
         err = result.get("error")
         if err:
             self._set_status_text(f"Error: {err}", CLR_RED)
+        self._refresh_log()
+
+    def _refresh_log(self) -> None:
+        data = _bridge_get("/debug/log")
+        entries = data.get("log", [])
+        if entries:
+            self.after(0, lambda: self._write_log(entries))
+
+    def _write_log(self, entries: list) -> None:
+        self._log.config(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.insert("end", "\n".join(entries))
+        self._log.see("end")
+        self._log.config(state="disabled")
 
     def _lbl(self, parent, text: str, fg=None, font_size: int = 9) -> tk.Label:
         return tk.Label(parent, text=text, bg=CLR_BG, fg=fg or CLR_MUTED,
@@ -546,6 +560,23 @@ class TestWindow(tk.Toplevel):
                  bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
                  relief="flat", font=("Consolas", 9)).pack(side="left", padx=(0, 4), fill="x", expand=True)
         self._btn(o_row, "Open", self._on_open, width=5).pack(side="left")
+
+        # ── Debug log ─────────────────────────────────────────────────────────
+        lf = self._section(self, "Debug Log")
+        lf.pack(fill="x", **pad)
+
+        log_row = tk.Frame(lf, bg=CLR_BG)
+        log_row.pack(fill="x")
+        self._log = scrolledtext.ScrolledText(
+            log_row, height=6, width=66,
+            bg=CLR_PANEL, fg=CLR_YELLOW, insertbackground=CLR_TEXT,
+            font=("Consolas", 8), relief="flat", state="disabled", wrap="none",
+        )
+        self._log.pack(fill="x")
+        tk.Button(log_row, text="↺  Refresh Log", command=lambda: self._run(self._refresh_log),
+                  bg=CLR_BTN, fg=CLR_TEXT, activebackground=CLR_BTN_HOVER,
+                  relief="flat", padx=6, pady=2,
+                  font=("Segoe UI", 9), cursor="hand2").pack(anchor="e", pady=(2, 0))
 
         # centre window
         self.update_idletasks()
