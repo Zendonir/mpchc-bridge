@@ -863,6 +863,7 @@ async def _push_task(app: web.Application) -> None:
                     "muted": v.get("muted", "0") == "1",
                     "audio_track": v.get("audiotrack", ""),
                     "subtitle_track": v.get("subtitletrack", ""),
+                    "filepath": v.get("filepath", ""),
                 }
                 changed = {k: val for k, val in current.items() if prev.get(k) != val}
                 if changed:
