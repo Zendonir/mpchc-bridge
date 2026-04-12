@@ -15,23 +15,21 @@ import webbrowser
 from tkinter import font, messagebox, scrolledtext
 
 BRIDGE_PORT = 13580
-SVC_NAME = "MpcHcBridge"
-
-# ── Service helpers (via sc.exe — no pywin32 needed in the GUI thread) ─────────
+TASK_NAME = "MpcHcBridge"
 
 
-def _sc(*args: str, timeout: int = 10) -> tuple[int, str]:
-    """Run an sc.exe command and return (returncode, output)."""
+def _run(*args: str, timeout: int = 15) -> tuple[int, str]:
+    """Run a command and return (returncode, output)."""
     try:
         r = subprocess.run(
-            ["sc"] + list(args),
+            list(args),
             capture_output=True,
             text=True,
             timeout=timeout,
         )
         return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
     except subprocess.TimeoutExpired:
-        return -1, f"Timeout after {timeout}s — service may still be starting"
+        return -1, f"Timeout after {timeout}s"
     except Exception as ex:  # pylint: disable=broad-exception-caught
         return -1, str(ex)
 
@@ -41,38 +39,37 @@ def _self_exe() -> str:
     return sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
 
 
+# ── Task Scheduler helpers (no admin required) ────────────────────────────────
+
 def svc_status() -> str:
     """Return 'running', 'stopped', 'not_installed' or 'unknown'."""
-    code, out = _sc("query", SVC_NAME)
+    code, out = _run("schtasks", "/query", "/tn", TASK_NAME, "/fo", "LIST")
     if code != 0:
         return "not_installed"
-    if "RUNNING" in out:
+    if "Running" in out:
         return "running"
-    if "STOPPED" in out:
+    if "Ready" in out or "Bereit" in out:
         return "stopped"
     return "unknown"
 
 
 def svc_install() -> tuple[bool, str]:
-    """Install and configure the service for auto-start."""
+    """Register an ONLOGON task for the current user — no admin needed."""
     exe = _self_exe()
-    code, out = _sc(
-        "create", SVC_NAME,
-        f"binPath={exe} --service",
-        "start=auto",
-        "DisplayName=MPC-HC Control Bridge",
+    cmd = f'"{exe}" debug'
+    code, out = _run(
+        "schtasks", "/create",
+        "/tn", TASK_NAME,
+        "/tr", cmd,
+        "/sc", "ONLOGON",
+        "/f",
     )
-    if code != 0:
-        return False, out
-    # Add description
-    _sc("description", SVC_NAME,
-        "HTTP API bridge for UC Remote 3 — full MPC-HC control")
-    return True, out
+    return code == 0, out
 
 
 def svc_uninstall() -> tuple[bool, str]:
-    _sc("stop", SVC_NAME)
-    code, out = _sc("delete", SVC_NAME)
+    svc_stop()
+    code, out = _run("schtasks", "/delete", "/tn", TASK_NAME, "/f")
     return code == 0, out
 
 
@@ -121,13 +118,15 @@ def fw_remove_rule() -> tuple[bool, str]:
 
 
 def svc_start() -> tuple[bool, str]:
-    code, out = _sc("start", SVC_NAME, timeout=30)
+    code, out = _run("schtasks", "/run", "/tn", TASK_NAME)
     return code == 0, out
 
 
 def svc_stop() -> tuple[bool, str]:
-    code, out = _sc("stop", SVC_NAME)
-    return code == 0, out
+    # Kill the bridge process by finding what listens on BRIDGE_PORT
+    import os
+    _run("taskkill", "/f", "/fi", f"IMAGENAME eq {os.path.basename(_self_exe())}")
+    return True, "Stopped."
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -191,7 +190,7 @@ class App(tk.Tk):
         btn_frame = tk.Frame(self, bg=CLR_BG)
         btn_frame.pack(fill="x", padx=16, pady=(0, 8))
 
-        self._btn_install = self._btn(btn_frame, "Install Service", self._on_install)
+        self._btn_install = self._btn(btn_frame, "Install", self._on_install)
         self._btn_install.pack(side="left", padx=(0, 6))
 
         self._btn_uninstall = self._btn(btn_frame, "Uninstall", self._on_uninstall)
@@ -294,21 +293,17 @@ class App(tk.Tk):
 
     def _on_install(self) -> None:
         def _do():
-            self._log_write("Installing service…")
+            self._log_write("Installing autostart task (no admin needed)…")
             ok, out = svc_install()
             self._log_write(out)
             if ok:
-                self._log_write("✔  Service installed. Starting…")
+                self._log_write("✔  Task installed. Starting…")
                 ok2, out2 = svc_start()
                 self._log_write(out2)
                 if ok2:
-                    self._log_write("✔  Service started.")
-                self._log_write(f"Adding firewall rule for port {BRIDGE_PORT}…")
-                ok3, out3 = fw_add_rule()
-                self._log_write(out3)
-                self._log_write(f"✔  Firewall rule added." if ok3 else "⚠  Firewall rule failed — add manually if needed.")
+                    self._log_write("✔  Bridge is running.")
             else:
-                self._log_write("✘  Install failed — run as Administrator?")
+                self._log_write("✘  Install failed.")
             self.after(0, self._refresh_status)
         self._run_in_thread(_do)
 
