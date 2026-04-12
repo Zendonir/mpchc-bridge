@@ -509,7 +509,7 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
     try:
         resolved = _resolve_filepath(filepath)
         with open(resolved, "rb") as fh:
-            buf = fh.read(524288)  # 512 KB
+            buf = fh.read(2097152)  # 2 MB — enough for large Blu-ray MKV headers
         n = len(buf)
         if n < 8 or buf[:4] != b"\x1a\x45\xdf\xa3":
             return None  # not MKV
@@ -835,17 +835,17 @@ async def _tracks(req: web.Request) -> web.Response:
             "filepath": filepath,
         })
 
-    # 2. MKV parsing — try simple parser first (gui.py logic), then full parser
-    mkv = _read_mkv_tracks_simple(filepath) or _read_mkv_tracks(filepath)
+    # 2. MKV parsing — full parser (chapters + path resolution)
+    mkv = _read_mkv_tracks(filepath)
     if mkv is not None:
         cur_audio_pos = _match_track(mkv["audio"], cur_audio)
         cur_sub_pos = _match_track(mkv["subtitle"], cur_sub)
         for t in mkv["audio"]:
             t["selected"] = t["pos"] == cur_audio_pos
-            t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
         for t in mkv["subtitle"]:
             t["selected"] = t["pos"] == cur_sub_pos
-            t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+        _apply_track_labels(mkv["audio"])
+        _apply_track_labels(mkv["subtitle"])
         return web.json_response({
             "audio": mkv["audio"],
             "subtitle": mkv["subtitle"],
@@ -1110,11 +1110,22 @@ async def _ws_handler(req: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+def _apply_track_labels(tracks: list[dict]) -> None:
+    """Set label on each track: use name if non-empty, else LANG CODEC."""
+    for t in tracks:
+        name = t.get("name", "").strip()
+        lang = t.get("lang", "").upper() or "UND"
+        codec = t.get("codec", "")
+        t["label"] = name if name else f"{lang} {codec}"
+
+
 async def _push_task(app: web.Application) -> None:
     """Poll MPC-HC locally and broadcast changed fields to WebSocket clients."""
     prev: dict = {}
     _cached_fp: str = ""
     _cached_tracks: dict | None = None
+    _cached_ap: int = -1
+    _cached_sp: int = -1
 
     while True:
         interval = _PUSH_INTERVAL_IDLE
@@ -1131,25 +1142,21 @@ async def _push_task(app: web.Application) -> None:
                 if filepath != _cached_fp:
                     _cached_fp = filepath
                     _cached_tracks = None
+                    _cached_ap = -1
+                    _cached_sp = -1
                     if filepath:
-                        def _parse_tracks_for_file(fp: str) -> dict | None:
-                            return _read_mkv_tracks_simple(fp) or _read_mkv_tracks(fp)
                         mkv = await asyncio.get_event_loop().run_in_executor(
-                            None, _parse_tracks_for_file, filepath
+                            None, _read_mkv_tracks, filepath
                         )
                         if mkv:
-                            cur_ap = _match_track(mkv["audio"], cur_audio)
-                            cur_sp = _match_track(mkv["subtitle"], cur_sub)
+                            _cached_ap = _match_track(mkv["audio"], cur_audio)
+                            _cached_sp = _match_track(mkv["subtitle"], cur_sub)
                             for t in mkv["audio"]:
-                                t["selected"] = t["pos"] == cur_ap
-                                t["label"] = (
-                                    f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
-                                )
+                                t["selected"] = t["pos"] == _cached_ap
                             for t in mkv["subtitle"]:
-                                t["selected"] = t["pos"] == cur_sp
-                                t["label"] = (
-                                    f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
-                                )
+                                t["selected"] = t["pos"] == _cached_sp
+                            _apply_track_labels(mkv["audio"])
+                            _apply_track_labels(mkv["subtitle"])
                             _cached_tracks = {
                                 "audio": mkv["audio"],
                                 "subtitle": mkv["subtitle"],
@@ -1157,11 +1164,24 @@ async def _push_task(app: web.Application) -> None:
                                 "chapters": mkv.get("chapters", []),
                             }
                         else:
-                            # Fallback: file unreadable (network share) — use controls.html
+                            # Fallback: file unreadable — use controls.html
                             ctrl = await _mpchc_get(app["session"], "/controls.html")
                             if ctrl:
                                 parsed = _parse_tracks(ctrl)
                                 _cached_tracks = _normalize_html_tracks(parsed)
+                else:
+                    # Update selected flags when track changes without file change
+                    if _cached_tracks:
+                        new_ap = _match_track(_cached_tracks["audio"], cur_audio)
+                        new_sp = _match_track(_cached_tracks["subtitle"], cur_sub)
+                        if new_ap != _cached_ap:
+                            _cached_ap = new_ap
+                            for t in _cached_tracks["audio"]:
+                                t["selected"] = t["pos"] == _cached_ap
+                        if new_sp != _cached_sp:
+                            _cached_sp = new_sp
+                            for t in _cached_tracks["subtitle"]:
+                                t["selected"] = t["pos"] == _cached_sp
 
                 current = {
                     "state_id": state_id,
@@ -1172,6 +1192,8 @@ async def _push_task(app: web.Application) -> None:
                     "muted": v.get("muted", "0") == "1",
                     "audio_track": cur_audio,
                     "subtitle_track": cur_sub,
+                    "current_audio_pos": _cached_ap,
+                    "current_sub_pos": _cached_sp,
                     "filepath": filepath,
                 }
                 if _cached_tracks is not None:
