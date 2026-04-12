@@ -18,6 +18,7 @@ from tkinter import font, messagebox, scrolledtext
 BRIDGE_PORT = 13580
 REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REG_VALUE = "MpcHcBridge"
+_PID_FILE = os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), "mpchc-bridge.pid")
 
 
 def _self_exe() -> str:
@@ -141,20 +142,32 @@ def svc_start() -> tuple[bool, str]:
     """Launch the bridge in the background (detached process)."""
     exe = _self_exe()
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [exe, "debug"],
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
+        try:
+            with open(_PID_FILE, "w") as f:
+                f.write(str(proc.pid))
+        except OSError:
+            pass
         return True, "Bridge process launched."
     except Exception as ex:  # pylint: disable=broad-exception-caught
         return False, str(ex)
 
 
 def svc_stop() -> tuple[bool, str]:
-    """Kill the bridge process by executable name."""
-    _run("taskkill", "/f", "/fi", f"IMAGENAME eq {os.path.basename(_self_exe())}")
-    return True, "Stopped."
+    """Kill only the bridge background process (by saved PID, not executable name)."""
+    try:
+        with open(_PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.remove(_PID_FILE)
+        _run("taskkill", "/f", "/pid", str(pid))
+        return True, f"Stopped (PID {pid})."
+    except (OSError, ValueError):
+        pass
+    return True, "Bridge process not found."
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
