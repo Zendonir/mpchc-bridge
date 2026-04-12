@@ -686,9 +686,12 @@ def _match_track(mkv_tracks: list[dict], current_name: str) -> int:
     cur_lang = lang_m.group(1) if lang_m else ""
     # Extract codec hint: ac3, dts, aac, flac, truehd, eac3, pcm, mp3, vorbis, opus, vobsub, ass, srt, subrip, pgs
     codec_hints = {
-        "ac3": "A_AC3", "dts": "A_DTS", "aac": "A_AAC", "flac": "A_FLAC",
-        "truehd": "A_TRUEHD", "eac3": "A_EAC3", "mp3": "A_MPEG", "opus": "A_OPUS",
-        "vorbis": "A_VORBIS", "vobsub": "S_VOBSUB", "ass": "S_TEXT/ASS",
+        # More specific strings must come before shorter ones that are substrings
+        "truehd": "A_TRUEHD", "eac3": "A_EAC3", "e-ac3": "A_EAC3",
+        "dts-hd": "A_DTS", "dts": "A_DTS",
+        "ac3": "A_AC3", "aac": "A_AAC", "flac": "A_FLAC",
+        "mp3": "A_MPEG", "opus": "A_OPUS", "vorbis": "A_VORBIS",
+        "vobsub": "S_VOBSUB", "ass": "S_TEXT/ASS",
         "subrip": "S_TEXT/UTF8", "pgs": "S_HDMV/PGS",
     }
     cur_codec = ""
