@@ -287,9 +287,13 @@ def _parse_mkv_chapters(buf: bytes, pos: int, el_end: int, n: int) -> list[dict]
 def _resolve_filepath(filepath: str) -> str:
     """Resolve a mapped-drive path (e.g. Y:\\) to a UNC path (e.g. \\\\server\\share\\).
 
-    Windows services / elevated processes often cannot see mapped drives.
-    Tries WNetGetConnectionW → QueryDosDeviceW → HKCU\\Network registry in order.
-    Returns the original path unchanged if none of the methods succeed.
+    Works in both user context and SYSTEM service context.
+    Tries four methods in order:
+      1. WNetGetConnectionW        — works in user context
+      2. QueryDosDeviceW           — works for subst/virtual drives
+      3. HKCU\\Network registry    — works in user context
+      4. HKEY_USERS scan           — works in SYSTEM context (scans all loaded user hives)
+    Returns the original path unchanged if all methods fail.
     """
     if sys.platform != "win32" or len(filepath) < 3 or filepath[1] != ":":
         return filepath
@@ -299,13 +303,13 @@ def _resolve_filepath(filepath: str) -> str:
     try:
         import winreg
 
-        # 1. WNetGetConnectionW — standard mapped network drives
+        # 1. WNetGetConnectionW — standard mapped network drives (user context)
         buf = ctypes.create_unicode_buffer(512)
         size = ctypes.c_ulong(512)
         if ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size)) == 0 and buf.value:
             return buf.value + rest
 
-        # 2. QueryDosDeviceW — subst / virtual drives (\??\UNC\... or \??\C:\real)
+        # 2. QueryDosDeviceW — subst / virtual drives
         buf2 = ctypes.create_unicode_buffer(1024)
         if ctypes.windll.kernel32.QueryDosDeviceW(drive, buf2, 1024) and buf2.value:
             target = buf2.value
@@ -313,8 +317,10 @@ def _resolve_filepath(filepath: str) -> str:
                 return "\\" + target[8:] + rest
             if target.startswith("\\??\\"):
                 return target[4:] + rest
+            if target.startswith("\\Device\\Mup\\"):
+                return "\\\\" + target[12:] + rest
 
-        # 3. HKCU\Network\{letter} — stored even when drive not in elevated token
+        # 3. HKCU\Network\{letter} — user context
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"Network\\{drive_letter}") as k:
                 unc = winreg.QueryValueEx(k, "RemotePath")[0]
@@ -323,9 +329,127 @@ def _resolve_filepath(filepath: str) -> str:
         except OSError:
             pass
 
+        # 4. HKEY_USERS scan — works in SYSTEM/service context
+        #    Enumerates all loaded user profile hives and checks their Network mappings
+        try:
+            hku = winreg.OpenKey(winreg.HKEY_USERS, "")
+            i = 0
+            while True:
+                try:
+                    sid = winreg.EnumKey(hku, i)
+                    i += 1
+                    if sid.endswith("_Classes"):
+                        continue
+                    try:
+                        with winreg.OpenKey(winreg.HKEY_USERS, f"{sid}\\Network\\{drive_letter}") as k:
+                            unc = winreg.QueryValueEx(k, "RemotePath")[0]
+                            if unc:
+                                return unc.rstrip("\\") + rest
+                    except OSError:
+                        pass
+                except OSError:
+                    break
+        except OSError:
+            pass
+
     except Exception:  # pylint: disable=broad-exception-caught
         pass
     return filepath
+
+
+def _read_mkv_tracks_simple(filepath: str) -> dict | None:
+    """Parse MKV EBML for audio + subtitle tracks only (ported 1:1 from gui.py).
+
+    Simpler and more robust than the full parser — no chapters/video,
+    but handles edge cases better. Used as primary fallback.
+    Returns {"audio": [...], "subtitle": [...]} or None on failure.
+    """
+    _ID_TRACKS  = 0x1654AE6B
+    _ID_CLUSTER = 0x1F43B675
+    _ID_ENTRY   = 0xAE
+    _ID_NUM     = 0xD7
+    _ID_TYPE    = 0x83
+    _ID_NAME    = 0x536E
+    _ID_LANG    = 0x22B59C
+    _ID_CODEC   = 0x86
+
+    resolved = _resolve_filepath(filepath)
+    try:
+        with open(resolved, "rb") as fh:
+            buf = fh.read(524288)
+        n = len(buf)
+        if n < 8:
+            return None
+        if buf[:4] != b"\x1a\x45\xdf\xa3":
+            return None
+
+        pos = 0
+        eid, pos = _ebml_id(buf, pos)
+        esz, pos = _ebml_size(buf, pos)
+        pos += esz  # skip EBML header
+
+        _seg_id, pos = _ebml_id(buf, pos)
+        esz, pos = _ebml_size(buf, pos)
+        seg_end = (pos + esz) if 0 <= esz < n else n
+
+        result: dict = {"audio": [], "subtitle": []}
+        while pos < min(seg_end, n) - 4:
+            try:
+                eid, npos = _ebml_id(buf, pos)
+                esz, npos = _ebml_size(buf, npos)
+            except (IndexError, ValueError):
+                break
+            if esz < 0 or npos + esz > n:
+                esz = n - npos
+            el_end = npos + esz
+
+            if eid == _ID_CLUSTER:
+                break
+            if eid == _ID_TRACKS:
+                tpos = npos
+                while tpos < min(el_end, n) - 2:
+                    try:
+                        tid, tpos2 = _ebml_id(buf, tpos)
+                        tsz, tpos2 = _ebml_size(buf, tpos2)
+                    except (IndexError, ValueError):
+                        break
+                    if tsz < 0:
+                        tsz = 0
+                    te_end = min(tpos2 + tsz, n)
+                    if tid == _ID_ENTRY:
+                        t: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": ""}
+                        epos = tpos2
+                        while epos < te_end - 2:
+                            try:
+                                fid, epos2 = _ebml_id(buf, epos)
+                                fsz, epos2 = _ebml_size(buf, epos2)
+                            except (IndexError, ValueError):
+                                break
+                            if fsz < 0:
+                                fsz = 0
+                            fd = buf[epos2: epos2 + fsz]
+                            if fid == _ID_NUM:    t["number"] = int.from_bytes(fd, "big")
+                            elif fid == _ID_TYPE: t["type"]   = int.from_bytes(fd, "big")
+                            elif fid == _ID_NAME: t["name"]   = fd.decode("utf-8", errors="replace")
+                            elif fid == _ID_LANG: t["lang"]   = fd.decode("ascii", errors="replace").rstrip("\x00")
+                            elif fid == _ID_CODEC: t["codec"] = fd.decode("ascii", errors="replace").rstrip("\x00")
+                            epos = epos2 + fsz
+                        if t["type"] == 2:    # audio
+                            t["pos"] = len(result["audio"])
+                            result["audio"].append(t)
+                        elif t["type"] == 17:  # subtitle
+                            t["pos"] = len(result["subtitle"])
+                            result["subtitle"].append(t)
+                    tpos = te_end
+                if result["audio"] or result["subtitle"]:
+                    return result
+            pos = npos + esz
+
+        if result["audio"] or result["subtitle"]:
+            return result
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return None
 
 
 def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
@@ -696,8 +820,8 @@ async def _tracks(req: web.Request) -> web.Response:
             "filepath": filepath,
         })
 
-    # 2. Direct MKV parsing (works for local files)
-    mkv = _read_mkv_tracks(filepath)
+    # 2. MKV parsing — try simple parser first (gui.py logic), then full parser
+    mkv = _read_mkv_tracks_simple(filepath) or _read_mkv_tracks(filepath)
     if mkv is not None:
         cur_audio_pos = _match_track(mkv["audio"], cur_audio)
         cur_sub_pos = _match_track(mkv["subtitle"], cur_sub)
@@ -993,8 +1117,10 @@ async def _push_task(app: web.Application) -> None:
                     _cached_fp = filepath
                     _cached_tracks = None
                     if filepath:
+                        def _parse_tracks_for_file(fp: str) -> dict | None:
+                            return _read_mkv_tracks_simple(fp) or _read_mkv_tracks(fp)
                         mkv = await asyncio.get_event_loop().run_in_executor(
-                            None, _read_mkv_tracks, filepath
+                            None, _parse_tracks_for_file, filepath
                         )
                         if mkv:
                             cur_ap = _match_track(mkv["audio"], cur_audio)
