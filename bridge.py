@@ -847,6 +847,9 @@ async def _ws_handler(req: web.Request) -> web.WebSocketResponse:
 async def _push_task(app: web.Application) -> None:
     """Poll MPC-HC locally and broadcast changed fields to WebSocket clients."""
     prev: dict = {}
+    _cached_fp: str = ""
+    _cached_tracks: dict | None = None
+
     while True:
         interval = _PUSH_INTERVAL_IDLE
         try:
@@ -854,6 +857,38 @@ async def _push_task(app: web.Application) -> None:
             if html is not None:
                 v = _parse_variables(html)
                 state_id = int(v.get("state", 0))
+                filepath = v.get("filepath", "")
+                cur_audio = v.get("audiotrack", "")
+                cur_sub = v.get("subtitletrack", "")
+
+                # Re-parse MKV tracks whenever the file changes
+                if filepath != _cached_fp:
+                    _cached_fp = filepath
+                    _cached_tracks = None
+                    if filepath:
+                        mkv = await asyncio.get_event_loop().run_in_executor(
+                            None, _read_mkv_tracks, filepath
+                        )
+                        if mkv:
+                            cur_ap = _match_track(mkv["audio"], cur_audio)
+                            cur_sp = _match_track(mkv["subtitle"], cur_sub)
+                            for t in mkv["audio"]:
+                                t["selected"] = t["pos"] == cur_ap
+                                t["label"] = (
+                                    f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+                                )
+                            for t in mkv["subtitle"]:
+                                t["selected"] = t["pos"] == cur_sp
+                                t["label"] = (
+                                    f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+                                )
+                            _cached_tracks = {
+                                "audio": mkv["audio"],
+                                "subtitle": mkv["subtitle"],
+                                "video": mkv.get("video", []),
+                                "chapters": mkv.get("chapters", []),
+                            }
+
                 current = {
                     "state_id": state_id,
                     "state": {0: "stopped", 1: "paused", 2: "playing"}.get(state_id, "unknown"),
@@ -861,10 +896,13 @@ async def _push_task(app: web.Application) -> None:
                     "duration_ms": int(v.get("duration", 0)),
                     "volume": int(v.get("volumelevel", 0)),
                     "muted": v.get("muted", "0") == "1",
-                    "audio_track": v.get("audiotrack", ""),
-                    "subtitle_track": v.get("subtitletrack", ""),
-                    "filepath": v.get("filepath", ""),
+                    "audio_track": cur_audio,
+                    "subtitle_track": cur_sub,
+                    "filepath": filepath,
                 }
+                if _cached_tracks is not None:
+                    current["tracks"] = _cached_tracks
+
                 changed = {k: val for k, val in current.items() if prev.get(k) != val}
                 if changed:
                     if _ws_clients:
