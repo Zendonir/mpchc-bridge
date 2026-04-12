@@ -496,6 +496,8 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
     _ID_VIDEO    = 0xE0
     _ID_PX_W     = 0xB0
     _ID_PX_H     = 0xBA
+    _ID_AUDIO    = 0xE1
+    _ID_CHANNELS = 0x9F
     _TYPE_VIDEO  = 1
     _TYPE_AUDIO  = 2
     _TYPE_SUB    = 17
@@ -589,7 +591,7 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
                     te_end = tpos2 + tsz
                     if tid == _ID_ENTRY:
                         track: dict = {"number": 0, "type": 0, "name": "", "lang": "", "codec": "",
-                                       "width": 0, "height": 0}
+                                       "channels": 0, "width": 0, "height": 0}
                         epos = tpos2
                         while epos < min(te_end, n) - 2:
                             try:
@@ -617,6 +619,18 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
                                     if vid == _ID_PX_W: track["width"]  = int.from_bytes(vdata, "big")
                                     elif vid == _ID_PX_H: track["height"] = int.from_bytes(vdata, "big")
                                     vpos = vpos2 + vsz
+                            elif fid == _ID_AUDIO:
+                                apos = epos2
+                                while apos < min(epos2 + fsz, n) - 2:
+                                    try:
+                                        aid, apos2 = _ebml_id(buf, apos)
+                                        asz, apos2 = _ebml_size(buf, apos2)
+                                    except (IndexError, ValueError):
+                                        break
+                                    if asz < 0: asz = 0
+                                    if aid == _ID_CHANNELS:
+                                        track["channels"] = int.from_bytes(buf[apos2: apos2 + asz], "big")
+                                    apos = apos2 + asz
                             epos = epos2 + fsz
                         if track["type"] == _TYPE_VIDEO:
                             short = _CODEC_SHORT.get(track["codec"], track["codec"].split("/")[-1])
@@ -1110,13 +1124,63 @@ async def _ws_handler(req: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+_AUDIO_CODEC_NAME: dict[str, str] = {
+    "A_AC3":            "Dolby Digital",
+    "A_EAC3":           "Dolby Digital Plus",
+    "A_TRUEHD":         "TrueHD",
+    "A_DTS":            "DTS",
+    "A_FLAC":           "FLAC",
+    "A_AAC":            "AAC",
+    "A_MP3":            "MP3",
+    "A_OPUS":           "Opus",
+    "A_VORBIS":         "Vorbis",
+    "A_PCM/INT/LIT":    "PCM",
+    "A_PCM/INT/BIG":    "PCM",
+    "A_PCM/FLOAT/IEEE": "PCM",
+}
+_CHANNELS_STR: dict[int, str] = {
+    1: "1.0", 2: "2.0", 3: "2.1", 4: "4.0",
+    5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1",
+}
+_SUB_CODEC_NAME: dict[str, str] = {
+    "S_HDMV/PGS": "PGS",
+    "S_VOBSUB":   "VobSub",
+    "S_TEXT/UTF8": "SRT",
+    "S_TEXT/ASS":  "ASS",
+    "S_TEXT/SSA":  "SSA",
+    "S_DVBSUB":    "DVB",
+    "S_HDMV/TEXTST": "TextST",
+}
+
+
 def _apply_track_labels(tracks: list[dict]) -> None:
-    """Set label on each track: use name if non-empty, else LANG CODEC."""
+    """Set label on each track based on codec, channels, language."""
     for t in tracks:
-        name = t.get("name", "").strip()
         lang = t.get("lang", "").upper() or "UND"
         codec = t.get("codec", "")
-        t["label"] = name if name else f"{lang} {codec}"
+        name = t.get("name", "").strip()
+        name_l = name.lower()
+
+        if t.get("type") == 2:  # audio
+            codec_name = _AUDIO_CODEC_NAME.get(codec, codec.replace("A_", ""))
+            ch = _CHANNELS_STR.get(t.get("channels", 0), "")
+            atmos = " Atmos" if "atmos" in name_l else ""
+            parts = [lang]
+            if ch:
+                parts.append(ch)
+            parts.append(codec_name + atmos)
+            t["label"] = " ".join(parts)
+        else:  # subtitle
+            codec_name = _SUB_CODEC_NAME.get(codec, codec.split("/")[-1].replace("S_", ""))
+            hints = []
+            if "forced" in name_l:
+                hints.append("Forced")
+            if "sdh" in name_l:
+                hints.append("SDH")
+            t["label"] = " ".join([lang] + hints + [codec_name])
+
+
+_TRACK_SETTLE_S = 1.5   # seconds to wait after last track change before pushing pos
 
 
 async def _push_task(app: web.Application) -> None:
@@ -1126,6 +1190,8 @@ async def _push_task(app: web.Application) -> None:
     _cached_tracks: dict | None = None
     _cached_ap: int = -1
     _cached_sp: int = -1
+    _ap_settle_until: float = 0.0
+    _sp_settle_until: float = 0.0
 
     while True:
         interval = _PUSH_INTERVAL_IDLE
@@ -1174,15 +1240,19 @@ async def _push_task(app: web.Application) -> None:
                     if _cached_tracks:
                         new_ap = _match_track(_cached_tracks["audio"], cur_audio)
                         new_sp = _match_track(_cached_tracks["subtitle"], cur_sub)
+                        now = time.monotonic()
                         if new_ap != _cached_ap:
                             _cached_ap = new_ap
+                            _ap_settle_until = now + _TRACK_SETTLE_S
                             for t in _cached_tracks["audio"]:
                                 t["selected"] = t["pos"] == _cached_ap
                         if new_sp != _cached_sp:
                             _cached_sp = new_sp
+                            _sp_settle_until = now + _TRACK_SETTLE_S
                             for t in _cached_tracks["subtitle"]:
                                 t["selected"] = t["pos"] == _cached_sp
 
+                now = time.monotonic()
                 current = {
                     "state_id": state_id,
                     "state": {0: "stopped", 1: "paused", 2: "playing"}.get(state_id, "unknown"),
@@ -1192,10 +1262,13 @@ async def _push_task(app: web.Application) -> None:
                     "muted": v.get("muted", "0") == "1",
                     "audio_track": cur_audio,
                     "subtitle_track": cur_sub,
-                    "current_audio_pos": _cached_ap,
-                    "current_sub_pos": _cached_sp,
                     "filepath": filepath,
                 }
+                # Only push pos after it's settled (debounce mid-cycle track changes)
+                if now >= _ap_settle_until:
+                    current["current_audio_pos"] = _cached_ap
+                if now >= _sp_settle_until:
+                    current["current_sub_pos"] = _cached_sp
                 if _cached_tracks is not None:
                     current["tracks"] = _cached_tracks
 

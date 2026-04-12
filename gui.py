@@ -262,7 +262,7 @@ class App(tk.Tk):
         self._log = scrolledtext.ScrolledText(
             log_frame, height=8, width=54,
             bg=CLR_PANEL, fg=CLR_TEXT, insertbackground=CLR_TEXT,
-            font=("Consolas", 9), relief="flat", state="disabled",
+            font=("Consolas", 8), relief="flat", state="disabled",
             wrap="word",
         )
         self._log.pack(fill="both")
