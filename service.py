@@ -12,6 +12,8 @@ Usage (run as Administrator):
 """
 
 import asyncio
+import os
+import subprocess
 import sys
 
 
@@ -107,6 +109,72 @@ def _print_usage() -> None:
     print(__doc__)
 
 
+_TASK_NAME = "MpcHcBridge"
+
+
+def _install_interactive() -> None:
+    """Install MPC-HC Bridge as a Task Scheduler task for the current user.
+
+    Runs at logon with full user privileges — no password required, and the
+    task automatically has access to mapped network drives (e.g. Y:\\).
+    """
+    exe = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0])
+    # When frozen (PyInstaller), sys.executable IS the exe.
+    # In source mode, use this script's path but run with 'debug' arg.
+    if not getattr(sys, "frozen", False):
+        cmd = f'"{exe}" "{os.path.abspath(__file__)}" debug'
+    else:
+        cmd = f'"{exe}" debug'
+
+    result = subprocess.run(
+        [
+            "schtasks", "/create",
+            "/tn", _TASK_NAME,
+            "/tr", cmd,
+            "/sc", "ONLOGON",
+            "/rl", "HIGHEST",
+            "/f",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"Installed: task '{_TASK_NAME}' will start at logon for current user.")
+        print("Run 'start' to launch it now without rebooting.")
+    else:
+        print(f"ERROR installing task:\n{result.stderr or result.stdout}")
+        sys.exit(1)
+
+
+def _remove_task() -> None:
+    result = subprocess.run(
+        ["schtasks", "/delete", "/tn", _TASK_NAME, "/f"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"Removed task '{_TASK_NAME}'.")
+    else:
+        print(f"ERROR: {result.stderr or result.stdout}")
+
+
+def _start_task() -> None:
+    result = subprocess.run(
+        ["schtasks", "/run", "/tn", _TASK_NAME],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"Task '{_TASK_NAME}' started.")
+    else:
+        print(f"ERROR: {result.stderr or result.stdout}")
+
+
+def _status_task() -> None:
+    result = subprocess.run(
+        ["schtasks", "/query", "/tn", _TASK_NAME, "/fo", "LIST"],
+        capture_output=True, text=True,
+    )
+    print(result.stdout or result.stderr)
+
+
 def main() -> None:
     """Dispatch based on arguments, or launch GUI if none given."""
     args = sys.argv[1:]
@@ -136,13 +204,29 @@ def main() -> None:
         bridge_main()
         return
 
+    if args[0] == "install":
+        _install_interactive()
+        return
+
+    if args[0] == "remove":
+        _remove_task()
+        return
+
+    if args[0] == "start":
+        _start_task()
+        return
+
     if args[0] == "status":
-        import subprocess
-        result = subprocess.run(
-            ["sc", "query", "MpcHcBridge"],
-            capture_output=True, text=True,
+        _status_task()
+        return
+
+    if args[0] == "stop":
+        # Kill the running bridge process by port
+        subprocess.run(
+            ["taskkill", "/f", "/im", os.path.basename(sys.executable)],
+            capture_output=True,
         )
-        print(result.stdout or result.stderr)
+        print("Stopped.")
         return
 
     if not _PYWIN32_AVAILABLE:
