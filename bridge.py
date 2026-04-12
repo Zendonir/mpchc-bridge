@@ -571,8 +571,35 @@ async def _status(req: web.Request) -> web.Response:
     )
 
 
+def _normalize_html_tracks(parsed: dict) -> dict:
+    """Convert _parse_tracks() output to the same format as _read_mkv_tracks() with labels.
+
+    _parse_tracks gives {"index": int, "name": str, "selected": bool}.
+    We rename "index" → "pos" and add a "label" equal to "name".
+    """
+    result = {}
+    for key in ("audio", "subtitle"):
+        tracks = []
+        for t in parsed.get(key, []):
+            tracks.append({
+                "pos": t["index"],
+                "name": t["name"],
+                "label": t["name"],
+                "selected": t["selected"],
+            })
+        result[key] = tracks
+    result["video"] = []
+    result["chapters"] = []
+    return result
+
+
 async def _tracks(req: web.Request) -> web.Response:
-    """List available audio and subtitle tracks, parsed from the open MKV file."""
+    """List available audio and subtitle tracks.
+
+    Tries MKV EBML parsing first (gives lang/codec detail).
+    Falls back to controls.html parsing when the file is on a network path
+    or otherwise unreadable by the bridge process.
+    """
     html = await _mpchc_get(req.app["session"], "/variables.html")
     if html is None:
         return web.json_response({"error": "MPC-HC not reachable"}, status=503)
@@ -585,24 +612,38 @@ async def _tracks(req: web.Request) -> web.Response:
         return web.json_response({"error": "No file loaded in MPC-HC"}, status=404)
 
     mkv = _read_mkv_tracks(filepath)
-    if mkv is None:
+    if mkv is not None:
+        cur_audio_pos = _match_track(mkv["audio"], cur_audio)
+        cur_sub_pos = _match_track(mkv["subtitle"], cur_sub)
+        for t in mkv["audio"]:
+            t["selected"] = t["pos"] == cur_audio_pos
+            t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+        for t in mkv["subtitle"]:
+            t["selected"] = t["pos"] == cur_sub_pos
+            t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
+        return web.json_response({
+            "audio": mkv["audio"],
+            "subtitle": mkv["subtitle"],
+            "video": mkv.get("video", []),
+            "chapters": mkv.get("chapters", []),
+            "current_audio_pos": cur_audio_pos,
+            "current_sub_pos": cur_sub_pos,
+            "filepath": filepath,
+        })
+
+    # Fallback: read track list from MPC-HC controls.html (works for network paths)
+    ctrl_html = await _mpchc_get(req.app["session"], "/controls.html")
+    if ctrl_html is None:
         return web.json_response({"error": f"Cannot read track info from: {filepath}"}, status=422)
-
-    cur_audio_pos = _match_track(mkv["audio"], cur_audio)
-    cur_sub_pos = _match_track(mkv["subtitle"], cur_sub)
-
-    for t in mkv["audio"]:
-        t["selected"] = t["pos"] == cur_audio_pos
-        t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
-    for t in mkv["subtitle"]:
-        t["selected"] = t["pos"] == cur_sub_pos
-        t["label"] = f"{t['lang'].upper() or '?'}  {t['codec']}  {t['name']}".strip()
-
+    parsed = _parse_tracks(ctrl_html)
+    normalized = _normalize_html_tracks(parsed)
+    cur_audio_pos = next((t["pos"] for t in normalized["audio"] if t["selected"]), 0)
+    cur_sub_pos = next((t["pos"] for t in normalized["subtitle"] if t["selected"]), -1)
     return web.json_response({
-        "audio": mkv["audio"],
-        "subtitle": mkv["subtitle"],
-        "video": mkv.get("video", []),
-        "chapters": mkv.get("chapters", []),
+        "audio": normalized["audio"],
+        "subtitle": normalized["subtitle"],
+        "video": [],
+        "chapters": [],
         "current_audio_pos": cur_audio_pos,
         "current_sub_pos": cur_sub_pos,
         "filepath": filepath,
@@ -861,7 +902,7 @@ async def _push_task(app: web.Application) -> None:
                 cur_audio = v.get("audiotrack", "")
                 cur_sub = v.get("subtitletrack", "")
 
-                # Re-parse MKV tracks whenever the file changes
+                # Re-parse tracks whenever the file changes
                 if filepath != _cached_fp:
                     _cached_fp = filepath
                     _cached_tracks = None
@@ -888,6 +929,12 @@ async def _push_task(app: web.Application) -> None:
                                 "video": mkv.get("video", []),
                                 "chapters": mkv.get("chapters", []),
                             }
+                        else:
+                            # Fallback: file unreadable (network share) — use controls.html
+                            ctrl = await _mpchc_get(app["session"], "/controls.html")
+                            if ctrl:
+                                parsed = _parse_tracks(ctrl)
+                                _cached_tracks = _normalize_html_tracks(parsed)
 
                 current = {
                     "state_id": state_id,
