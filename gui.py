@@ -4,6 +4,7 @@ Provides a simple tkinter window to install, uninstall, start and stop the servi
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -15,7 +16,13 @@ import webbrowser
 from tkinter import font, messagebox, scrolledtext
 
 BRIDGE_PORT = 13580
-TASK_NAME = "MpcHcBridge"
+REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+REG_VALUE = "MpcHcBridge"
+
+
+def _self_exe() -> str:
+    """Return path to the running executable."""
+    return sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
 
 
 def _run(*args: str, timeout: int = 15) -> tuple[int, str]:
@@ -34,43 +41,56 @@ def _run(*args: str, timeout: int = 15) -> tuple[int, str]:
         return -1, str(ex)
 
 
-def _self_exe() -> str:
-    """Return path to the running executable."""
-    return sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
+# ── Registry HKCU Run autostart helpers (zero admin required) ─────────────────
 
-
-# ── Task Scheduler helpers (no admin required) ────────────────────────────────
-
-def svc_status() -> str:
-    """Return 'running', 'stopped', 'not_installed' or 'unknown'."""
-    code, out = _run("schtasks", "/query", "/tn", TASK_NAME, "/fo", "LIST")
-    if code != 0:
-        return "not_installed"
-    if "Running" in out:
-        return "running"
-    if "Ready" in out or "Bereit" in out:
-        return "stopped"
-    return "unknown"
+def _reg_cmd() -> str:
+    """Return the autostart command string stored in the registry."""
+    exe = _self_exe()
+    return f'"{exe}" debug'
 
 
 def svc_install() -> tuple[bool, str]:
-    """Register an ONLOGON task for the current user — no admin needed."""
-    exe = _self_exe()
-    cmd = f'"{exe}" debug'
-    code, out = _run(
-        "schtasks", "/create",
-        "/tn", TASK_NAME,
-        "/tr", cmd,
-        "/sc", "ONLOGON",
-        "/f",
-    )
-    return code == 0, out
+    """Register autostart via HKCU Run key — zero admin rights needed."""
+    import winreg
+    cmd = _reg_cmd()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, REG_VALUE, 0, winreg.REG_SZ, cmd)
+        return True, f"Autostart registered:\n  {cmd}"
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return False, str(ex)
 
 
 def svc_uninstall() -> tuple[bool, str]:
+    """Remove HKCU Run autostart entry."""
+    import winreg
     svc_stop()
-    code, out = _run("schtasks", "/delete", "/tn", TASK_NAME, "/f")
-    return code == 0, out
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, REG_VALUE)
+        return True, "Autostart entry removed."
+    except FileNotFoundError:
+        return True, "Already removed."
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return False, str(ex)
+
+
+def svc_status() -> str:
+    """Return 'running', 'stopped', or 'not_installed'."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY) as k:
+            winreg.QueryValueEx(k, REG_VALUE)
+    except FileNotFoundError:
+        return "not_installed"
+    except Exception:  # pylint: disable=broad-exception-caught
+        return "not_installed"
+    # Registered — check if actually running via HTTP ping
+    try:
+        urllib.request.urlopen(f"http://localhost:{BRIDGE_PORT}/status", timeout=1)
+        return "running"
+    except Exception:  # pylint: disable=broad-exception-caught
+        return "stopped"
 
 
 # ── Windows Firewall helpers ───────────────────────────────────────────────────
@@ -118,13 +138,21 @@ def fw_remove_rule() -> tuple[bool, str]:
 
 
 def svc_start() -> tuple[bool, str]:
-    code, out = _run("schtasks", "/run", "/tn", TASK_NAME)
-    return code == 0, out
+    """Launch the bridge in the background (detached process)."""
+    exe = _self_exe()
+    try:
+        subprocess.Popen(
+            [exe, "debug"],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        return True, "Bridge process launched."
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        return False, str(ex)
 
 
 def svc_stop() -> tuple[bool, str]:
-    # Kill the bridge process by finding what listens on BRIDGE_PORT
-    import os
+    """Kill the bridge process by executable name."""
     _run("taskkill", "/f", "/fi", f"IMAGENAME eq {os.path.basename(_self_exe())}")
     return True, "Stopped."
 
@@ -293,7 +321,7 @@ class App(tk.Tk):
 
     def _on_install(self) -> None:
         def _do():
-            self._log_write("Installing autostart task (no admin needed)…")
+            self._log_write("Registering autostart (no admin needed)…")
             ok, out = svc_install()
             self._log_write(out)
             if ok:
