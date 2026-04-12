@@ -1125,8 +1125,8 @@ async def _ws_handler(req: web.Request) -> web.WebSocketResponse:
 
 
 _AUDIO_CODEC_NAME: dict[str, str] = {
-    "A_AC3":            "Dolby Digital",
-    "A_EAC3":           "Dolby Digital Plus",
+    "A_AC3":            "DD",
+    "A_EAC3":           "DD+",
     "A_TRUEHD":         "TrueHD",
     "A_DTS":            "DTS",
     "A_FLAC":           "FLAC",
@@ -1180,9 +1180,6 @@ def _apply_track_labels(tracks: list[dict]) -> None:
             t["label"] = " ".join([lang] + hints + [codec_name])
 
 
-_TRACK_SETTLE_S = 1.5   # seconds to wait after last track change before pushing pos
-
-
 async def _push_task(app: web.Application) -> None:
     """Poll MPC-HC locally and broadcast changed fields to WebSocket clients."""
     prev: dict = {}
@@ -1190,8 +1187,6 @@ async def _push_task(app: web.Application) -> None:
     _cached_tracks: dict | None = None
     _cached_ap: int = -1
     _cached_sp: int = -1
-    _ap_settle_until: float = 0.0
-    _sp_settle_until: float = 0.0
 
     while True:
         interval = _PUSH_INTERVAL_IDLE
@@ -1240,19 +1235,15 @@ async def _push_task(app: web.Application) -> None:
                     if _cached_tracks:
                         new_ap = _match_track(_cached_tracks["audio"], cur_audio)
                         new_sp = _match_track(_cached_tracks["subtitle"], cur_sub)
-                        now = time.monotonic()
                         if new_ap != _cached_ap:
                             _cached_ap = new_ap
-                            _ap_settle_until = now + _TRACK_SETTLE_S
                             for t in _cached_tracks["audio"]:
                                 t["selected"] = t["pos"] == _cached_ap
                         if new_sp != _cached_sp:
                             _cached_sp = new_sp
-                            _sp_settle_until = now + _TRACK_SETTLE_S
                             for t in _cached_tracks["subtitle"]:
                                 t["selected"] = t["pos"] == _cached_sp
 
-                now = time.monotonic()
                 current = {
                     "state_id": state_id,
                     "state": {0: "stopped", 1: "paused", 2: "playing"}.get(state_id, "unknown"),
@@ -1262,13 +1253,10 @@ async def _push_task(app: web.Application) -> None:
                     "muted": v.get("muted", "0") == "1",
                     "audio_track": cur_audio,
                     "subtitle_track": cur_sub,
+                    "current_audio_pos": _cached_ap,
+                    "current_sub_pos": _cached_sp,
                     "filepath": filepath,
                 }
-                # Only push pos after it's settled (debounce mid-cycle track changes)
-                if now >= _ap_settle_until:
-                    current["current_audio_pos"] = _cached_ap
-                if now >= _sp_settle_until:
-                    current["current_sub_pos"] = _cached_sp
                 if _cached_tracks is not None:
                     current["tracks"] = _cached_tracks
 
