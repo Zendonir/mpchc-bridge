@@ -132,7 +132,6 @@ def _install_interactive() -> None:
             "/tn", _TASK_NAME,
             "/tr", cmd,
             "/sc", "ONLOGON",
-            "/rl", "HIGHEST",
             "/f",
         ],
         capture_output=True, text=True,
