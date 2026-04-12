@@ -309,7 +309,7 @@ def _resolve_filepath(filepath: str) -> str:
         if ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size)) == 0 and buf.value:
             return buf.value + rest
 
-        # 2. QueryDosDeviceW — subst / virtual drives
+        # 2. QueryDosDeviceW — subst / virtual / network drives
         buf2 = ctypes.create_unicode_buffer(1024)
         if ctypes.windll.kernel32.QueryDosDeviceW(drive, buf2, 1024) and buf2.value:
             target = buf2.value
@@ -319,6 +319,13 @@ def _resolve_filepath(filepath: str) -> str:
                 return target[4:] + rest
             if target.startswith("\\Device\\Mup\\"):
                 return "\\\\" + target[12:] + rest
+            if "\\Device\\LanmanRedirector\\" in target or "\\Device\\LanmanRedirector;" in target:
+                # Format: \Device\LanmanRedirector\;Y:0000000012345678\SERVER\SHARE
+                # Split and skip the session-id token to get \\SERVER\SHARE
+                parts = [p for p in target.split("\\") if p and not p.startswith(";")]
+                # parts = ["Device", "LanmanRedirector", "SERVER", "SHARE", ...]
+                if len(parts) >= 4:
+                    return "\\\\" + "\\".join(parts[2:]) + rest
 
         # 3. HKCU\Network\{letter} — user context
         try:
@@ -374,9 +381,17 @@ def _read_mkv_tracks_simple(filepath: str) -> dict | None:
     _ID_CODEC   = 0x86
 
     resolved = _resolve_filepath(filepath)
+    buf = b""
+    for path in ([resolved, filepath] if resolved != filepath else [filepath]):
+        try:
+            with open(path, "rb") as fh:
+                buf = fh.read(2097152)  # 2 MB — enough for large Blu-ray MKV headers
+            if len(buf) >= 8 and buf[:4] == b"\x1a\x45\xdf\xa3":
+                break
+            buf = b""
+        except OSError:
+            continue
     try:
-        with open(resolved, "rb") as fh:
-            buf = fh.read(524288)
         n = len(buf)
         if n < 8:
             return None
