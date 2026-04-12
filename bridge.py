@@ -638,12 +638,33 @@ def _normalize_html_tracks(parsed: dict) -> dict:
     return result
 
 
+# Cache populated by the GUI process via POST /tracks/push
+_tracks_cache: dict | None = None
+_tracks_cache_fp: str = ""
+
+
+async def _tracks_push(req: web.Request) -> web.Response:
+    """Accept track data pushed by the GUI (which runs as the user and can read MKV files).
+
+    Body: {"filepath": "...", "audio": [...], "subtitle": [...], "video": [...], "chapters": [...]}
+    """
+    global _tracks_cache, _tracks_cache_fp
+    try:
+        data = await req.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    _tracks_cache = data
+    _tracks_cache_fp = data.get("filepath", "")
+    return web.json_response({"ok": True})
+
+
 async def _tracks(req: web.Request) -> web.Response:
     """List available audio and subtitle tracks.
 
-    Tries MKV EBML parsing first (gives lang/codec detail).
-    Falls back to controls.html parsing when the file is on a network path
-    or otherwise unreadable by the bridge process.
+    Priority:
+    1. Cache populated by GUI via POST /tracks/push  (always has full data)
+    2. MKV EBML parser (works for local files)
+    3. controls.html fallback (limited — clsid2 fork may not expose select elements)
     """
     html = await _mpchc_get(req.app["session"], "/variables.html")
     if html is None:
@@ -656,6 +677,26 @@ async def _tracks(req: web.Request) -> web.Response:
     if not filepath:
         return web.json_response({"error": "No file loaded in MPC-HC"}, status=404)
 
+    # 1. GUI-pushed cache — most reliable, has full track detail
+    if _tracks_cache and _tracks_cache_fp == filepath:
+        cache = _tracks_cache
+        cur_audio_pos = _match_track(cache.get("audio", []), cur_audio)
+        cur_sub_pos = _match_track(cache.get("subtitle", []), cur_sub)
+        for t in cache.get("audio", []):
+            t["selected"] = t["pos"] == cur_audio_pos
+        for t in cache.get("subtitle", []):
+            t["selected"] = t["pos"] == cur_sub_pos
+        return web.json_response({
+            "audio": cache.get("audio", []),
+            "subtitle": cache.get("subtitle", []),
+            "video": cache.get("video", []),
+            "chapters": cache.get("chapters", []),
+            "current_audio_pos": cur_audio_pos,
+            "current_sub_pos": cur_sub_pos,
+            "filepath": filepath,
+        })
+
+    # 2. Direct MKV parsing (works for local files)
     mkv = _read_mkv_tracks(filepath)
     if mkv is not None:
         cur_audio_pos = _match_track(mkv["audio"], cur_audio)
@@ -676,7 +717,7 @@ async def _tracks(req: web.Request) -> web.Response:
             "filepath": filepath,
         })
 
-    # Fallback: read track list from MPC-HC controls.html (works for network paths)
+    # 3. controls.html fallback
     ctrl_html = await _mpchc_get(req.app["session"], "/controls.html")
     if ctrl_html is None:
         return web.json_response({"error": f"Cannot read track info from: {filepath}"}, status=422)
@@ -1028,6 +1069,56 @@ async def _cleanup(app: web.Application) -> None:
 # ── App factory + main ─────────────────────────────────────────────────────────
 
 
+async def _debug_resolve(req: web.Request) -> web.Response:
+    """Debug: show path resolution and MKV read result for the currently loaded file."""
+    html = await _mpchc_get(req.app["session"], "/variables.html")
+    if html is None:
+        return web.json_response({"error": "MPC-HC not reachable"}, status=503)
+    v = _parse_variables(html)
+    filepath = v.get("filepath", "")
+    if not filepath:
+        return web.json_response({"error": "No file loaded"}, status=404)
+
+    resolved = _resolve_filepath(filepath)
+    can_open = False
+    open_error = ""
+    try:
+        with open(resolved, "rb") as fh:
+            fh.read(8)
+        can_open = True
+    except Exception as ex:
+        open_error = str(ex)
+
+    mkv_result = None
+    mkv_error = ""
+    try:
+        mkv = _read_mkv_tracks(filepath)
+        if mkv is not None:
+            mkv_result = {
+                "audio_count": len(mkv.get("audio", [])),
+                "subtitle_count": len(mkv.get("subtitle", [])),
+                "chapter_count": len(mkv.get("chapters", [])),
+            }
+        else:
+            mkv_error = "returned None (parse failed or not MKV)"
+    except Exception as ex:
+        mkv_error = str(ex)
+
+    import os
+    return web.json_response({
+        "filepath": filepath,
+        "resolved": resolved,
+        "path_changed": resolved != filepath,
+        "can_open": can_open,
+        "open_error": open_error,
+        "mkv_result": mkv_result,
+        "mkv_error": mkv_error,
+        "process_user": os.environ.get("USERNAME", "unknown"),
+        "tracks_cache_fp": _tracks_cache_fp,
+        "tracks_cache_has_data": _tracks_cache is not None,
+    })
+
+
 def create_app() -> web.Application:
     """Create and return the aiohttp application (used by service wrapper too)."""
     app = web.Application()
@@ -1042,6 +1133,7 @@ def create_app() -> web.Application:
     app.router.add_get("/debug/log", _debug_log)
     app.router.add_get("/debug/controls", _debug_controls)
     app.router.add_get("/debug/variables", _debug_variables)
+    app.router.add_get("/debug/resolve", _debug_resolve)
     app.router.add_get("/ws", _ws_handler)
     app.router.add_post("/command/{cmd}", _command)
     app.router.add_post("/seek", _seek)
