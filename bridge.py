@@ -284,6 +284,50 @@ def _parse_mkv_chapters(buf: bytes, pos: int, el_end: int, n: int) -> list[dict]
     return chapters
 
 
+def _resolve_filepath(filepath: str) -> str:
+    """Resolve a mapped-drive path (e.g. Y:\\) to a UNC path (e.g. \\\\server\\share\\).
+
+    Windows services / elevated processes often cannot see mapped drives.
+    Tries WNetGetConnectionW → QueryDosDeviceW → HKCU\\Network registry in order.
+    Returns the original path unchanged if none of the methods succeed.
+    """
+    if sys.platform != "win32" or len(filepath) < 3 or filepath[1] != ":":
+        return filepath
+    drive_letter = filepath[0].upper()
+    drive = drive_letter + ":"
+    rest = filepath[2:]
+    try:
+        import winreg
+
+        # 1. WNetGetConnectionW — standard mapped network drives
+        buf = ctypes.create_unicode_buffer(512)
+        size = ctypes.c_ulong(512)
+        if ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size)) == 0 and buf.value:
+            return buf.value + rest
+
+        # 2. QueryDosDeviceW — subst / virtual drives (\??\UNC\... or \??\C:\real)
+        buf2 = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.QueryDosDeviceW(drive, buf2, 1024) and buf2.value:
+            target = buf2.value
+            if target.startswith("\\??\\UNC\\"):
+                return "\\" + target[8:] + rest
+            if target.startswith("\\??\\"):
+                return target[4:] + rest
+
+        # 3. HKCU\Network\{letter} — stored even when drive not in elevated token
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"Network\\{drive_letter}") as k:
+                unc = winreg.QueryValueEx(k, "RemotePath")[0]
+                if unc:
+                    return unc.rstrip("\\") + rest
+        except OSError:
+            pass
+
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return filepath
+
+
 def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
     """Parse MKV EBML for tracks, video info, and chapters.
 
@@ -324,7 +368,8 @@ def _read_mkv_tracks(filepath: str) -> dict[str, list] | None:
     }
 
     try:
-        with open(filepath, "rb") as fh:
+        resolved = _resolve_filepath(filepath)
+        with open(resolved, "rb") as fh:
             buf = fh.read(524288)  # 512 KB
         n = len(buf)
         if n < 8 or buf[:4] != b"\x1a\x45\xdf\xa3":
