@@ -140,6 +140,12 @@ def fw_remove_rule() -> tuple[bool, str]:
 
 def svc_start() -> tuple[bool, str]:
     """Launch the bridge in the background (detached process)."""
+    # Don't start a second instance if already running
+    try:
+        urllib.request.urlopen(f"http://localhost:{BRIDGE_PORT}/status", timeout=1)
+        return True, "Bridge is already running."
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
     exe = _self_exe()
     try:
         proc = subprocess.Popen(
