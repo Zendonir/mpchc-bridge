@@ -50,16 +50,69 @@ def _reg_cmd() -> str:
     return f'"{exe}" debug'
 
 
-def svc_install() -> tuple[bool, str]:
-    """Register autostart via HKCU Run key — zero admin rights needed."""
+def svc_install() -> tuple[bool, list[str]]:
+    """Register autostart via HKCU Run key — zero admin rights needed.
+
+    Also cleans up any legacy Windows service and kills any process
+    already occupying the bridge port before starting fresh.
+    """
     import winreg
+    log: list[str] = []
+
+    # 1. Stop & remove old Windows service (best-effort, may fail without admin)
+    log += _remove_old_windows_service(REG_VALUE)
+
+    # 2. Kill anything still holding the port (e.g. lingering SYSTEM service)
+    msg = _kill_port(BRIDGE_PORT)
+    if msg:
+        log.append(msg)
+
+    # 3. Register HKCU autostart
     cmd = _reg_cmd()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, REG_VALUE, 0, winreg.REG_SZ, cmd)
-        return True, f"Autostart registered:\n  {cmd}"
+        log.append(f"Autostart registered:\n  {cmd}")
+        return True, log
     except Exception as ex:  # pylint: disable=broad-exception-caught
-        return False, str(ex)
+        log.append(str(ex))
+        return False, log
+
+
+def _kill_port(port: int) -> str:
+    """Find and kill any process listening on the given port. Returns status message."""
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                pid = int(parts[-1])
+                subprocess.run(["taskkill", "/f", "/pid", str(pid)],
+                               capture_output=True, timeout=5)
+                return f"Killed process on port {port} (PID {pid})."
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return ""
+
+
+def _remove_old_windows_service(name: str) -> list[str]:
+    """Try to stop and delete a legacy Windows service. Returns log lines."""
+    lines = []
+    for action, args in [("stop", ["sc", "stop", name]), ("delete", ["sc", "delete", name])]:
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                lines.append(f"Old service '{name}' {action}ped.")
+            elif "1060" in r.stdout or "1060" in r.stderr:
+                pass  # service does not exist — nothing to do
+            elif "5" in r.returncode.__str__():
+                lines.append(f"Cannot {action} '{name}' (no admin). Kill by port instead.")
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+    return lines
 
 
 def svc_uninstall() -> tuple[bool, str]:
@@ -340,11 +393,12 @@ class App(tk.Tk):
 
     def _on_install(self) -> None:
         def _do():
-            self._log_write("Registering autostart (no admin needed)…")
-            ok, out = svc_install()
-            self._log_write(out)
+            self._log_write("Installing…")
+            ok, lines = svc_install()
+            for line in lines:
+                self._log_write(line)
             if ok:
-                self._log_write("✔  Task installed. Starting…")
+                self._log_write("Starting…")
                 ok2, out2 = svc_start()
                 self._log_write(out2)
                 if ok2:
